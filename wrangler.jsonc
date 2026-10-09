@@ -1,0 +1,19 @@
+{
+  // Trả dần mỗi ngày: page in /public + API in worker.js
+  "name": "tra-no",
+  "main": "worker.js",
+  "compatibility_date": "2025-09-01",
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "html_handling": "none",
+    "not_found_handling": "none"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "tra-no-db",
+      "database_id": "PASTE-YOUR-DATABASE-ID-HERE"
+    }
+  ]
+}
