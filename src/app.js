@@ -1,0 +1,1013 @@
+'use strict';
+/* ===== Trả dần mỗi ngày — app ===== */
+const APP_ID = 'tra-no';
+const LS = { cache: 'trn.v1', auth: 'trn.auth', out: 'trn.out', dev: 'trn.dev', vis: 'trn.vis', diag: 'trn.diag' };
+const WD = ['Chủ nhật', 'Thứ Hai', 'Thứ Ba', 'Thứ Tư', 'Thứ Năm', 'Thứ Sáu', 'Thứ Bảy'];
+
+/* ---------- storage (never throws) ---------- */
+let STORAGE_OK = true;
+function lsGet(k) { try { return localStorage.getItem(k); } catch (e) { STORAGE_OK = false; return null; } }
+function lsSet(k, v) { try { localStorage.setItem(k, v); return true; } catch (e) { STORAGE_OK = false; return false; } }
+function lsDel(k) { try { localStorage.removeItem(k); } catch (e) { /* ignore */ } }
+function lsJSON(k, d) { try { const v = JSON.parse(lsGet(k) || 'null'); return v == null ? d : v; } catch (e) { return d; } }
+
+/* ---------- diagnostics ---------- */
+function logDiag(msg) {
+  const a = lsJSON(LS.diag, []); const list = Array.isArray(a) ? a : [];
+  list.push(new Date().toISOString().slice(0, 19) + ' ' + String(msg).slice(0, 300));
+  lsSet(LS.diag, JSON.stringify(list.slice(-40)));
+}
+window.addEventListener('error', e => logDiag('error: ' + (e.message || '') + ' @' + (e.lineno || '')));
+window.addEventListener('unhandledrejection', e => logDiag('promise: ' + ((e.reason && e.reason.message) || e.reason)));
+
+/* ---------- helpers ---------- */
+const $ = s => document.querySelector(s);
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const money = n => (n < 0 ? '-' : '') + String(Math.round(Math.abs(n))).replace(/\B(?=(\d{3})+(?!\d))/g, '.') + 'đ';
+function short(n) {
+  if (n >= 1e6) return (Math.round(n / 1e5) / 10).toString().replace('.', ',') + 'tr';
+  if (n >= 1000) return Math.round(n / 1000) + 'k';
+  return String(n);
+}
+const cap = s => s ? s.charAt(0).toUpperCase() + s.slice(1) : s;
+const PREVIEW = (() => { try { const q = new URLSearchParams(location.search).get('now'); const t = q ? Date.parse(q) : NaN; return isNaN(t) ? 0 : t - Date.now(); } catch (e) { return 0; } })();
+const NOW = () => new Date(Date.now() + PREVIEW);
+const keyOf = d => d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+const todayKey = () => keyOf(NOW());
+const parseKey = k => { const [y, m, d] = k.split('-').map(Number); return new Date(y, m - 1, d); };
+function addDays(k, n) { const d = parseKey(k); d.setDate(d.getDate() + n); return keyOf(d); }
+const fmtDay = k => { const d = parseKey(k); return d.getDate() + '/' + (d.getMonth() + 1); };
+function fmtDayLong(k) {
+  const t = todayKey();
+  if (k === t) return 'Hôm nay';
+  if (k === addDays(t, -1)) return 'Hôm qua';
+  const d = parseKey(k); return WD[d.getDay()] + ' ' + fmtDay(k) + (d.getFullYear() !== NOW().getFullYear() ? '/' + d.getFullYear() : '');
+}
+const hhmm = t => { const d = new Date(t); return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0'); };
+const newId = p => p + '-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+const isDate = s => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s) && keyOf(parseKey(s)) === s;
+/* "150" -> 150.000, "150k" -> 150.000, "1,5tr" -> 1.500.000, "150.000" -> 150.000 */
+function parseAmount(s) {
+  s = String(s || '').toLowerCase().replace(/\s+/g, '').replace(/đ|vnd/g, '');
+  if (!s) return null;
+  let mult = 1;
+  if (/(tr|m|triệu)$/.test(s)) { mult = 1e6; s = s.replace(/(tr|m|triệu)$/, ''); }
+  else if (/(k|nghìn|ngàn)$/.test(s)) { mult = 1e3; s = s.replace(/(k|nghìn|ngàn)$/, ''); }
+  let n;
+  if (mult > 1) n = parseFloat(s.replace(',', '.')) * mult;
+  else { const digits = s.replace(/[^\d]/g, ''); if (!digits || /[^\d.,]/.test(s)) return null; n = Number(digits); if (n > 0 && n < 1000) n *= 1000; }
+  n = Math.round(n);
+  return Number.isFinite(n) && n >= 1000 && n <= 1e9 ? n : null;
+}
+
+/* ---------- state ---------- */
+const DEF_SETTINGS = { target: 150000, payer: 'anh Trường', admin: 'Mẫn', start: '' };
+let AUTH = null;        // {role:'admin'|'payer', pin?, key?, server}
+let CACHE = { v: 0, settings: { ...DEF_SETTINGS }, entries: [] };
+let OUT = [];           // ops waiting to be sent
+let DEV = {};           // device-only: theme lock, lite, lastExport
+const UI = { range: 30, filter: 'all', cal: '', more: 30, pmore: 10, theme: 'forest', phase: 'day', sceneKey: '' };
+
+function cleanEntry(x) {
+  if (!x || typeof x !== 'object' || typeof x.id !== 'string' || !/^[A-Za-z0-9-]{4,40}$/.test(x.id)) return null;
+  if (!['repay', 'advance', 'miss'].includes(x.type) || !isDate(x.date)) return null;
+  const amount = x.type === 'miss' ? 0 : Math.round(Number(x.amount));
+  if (x.type !== 'miss' && !(amount >= 1000 && amount <= 1e9)) return null;
+  const n = v => { const t = Number(v); return Number.isFinite(t) && t > 0 ? t : 0; };
+  return {
+    id: x.id, type: x.type, amount, date: x.date, note: String(x.note || '').slice(0, 200),
+    status: ['pending', 'ok', 'rejected'].includes(x.status) ? x.status : 'ok', by: x.by === 'payer' ? 'payer' : 'admin',
+    reason: String(x.reason || '').slice(0, 200), created: n(x.created), updated: n(x.updated)
+  };
+}
+function cleanSettings(o) {
+  o = o && typeof o === 'object' ? o : {};
+  const t = Math.round(Number(o.target));
+  return {
+    target: t >= 1000 && t <= 1e8 ? t : DEF_SETTINGS.target,
+    payer: typeof o.payer === 'string' && o.payer.trim() ? o.payer.trim().slice(0, 30) : DEF_SETTINGS.payer,
+    admin: typeof o.admin === 'string' && o.admin.trim() ? o.admin.trim().slice(0, 30) : DEF_SETTINGS.admin,
+    start: isDate(o.start) ? o.start : ''
+  };
+}
+function cleanCache(o) {
+  o = o && typeof o === 'object' ? o : {};
+  return { v: Number.isInteger(o.v) ? o.v : 0, settings: cleanSettings(o.settings), entries: (Array.isArray(o.entries) ? o.entries : []).map(cleanEntry).filter(Boolean) };
+}
+function loadAll() {
+  const a = lsJSON(LS.auth, null);
+  if (a && (a.role === 'admin' && /^\d{4,8}$/.test(a.pin || '') || a.role === 'payer' && /^[a-z0-9]{8,64}$/.test(a.key || '')))
+    AUTH = { role: a.role, pin: a.pin, key: a.key, server: /^https?:\/\/[^\s"'<>]+$/.test(a.server || '') ? a.server : '' };
+  CACHE = cleanCache(lsJSON(LS.cache, {}));
+  const o = lsJSON(LS.out, []); OUT = Array.isArray(o) ? o.filter(x => x && typeof x.op === 'string').slice(0, 500) : [];
+  const d = lsJSON(LS.dev, {}); DEV = { theme: Object.keys(THEMES).includes(d.theme) ? d.theme : '', lite: !!d.lite, lastExport: Number(d.lastExport) || 0 };
+}
+const saveAuth = () => AUTH ? lsSet(LS.auth, JSON.stringify(AUTH)) : lsDel(LS.auth);
+const saveCache = () => lsSet(LS.cache, JSON.stringify(CACHE));
+const saveOut = () => lsSet(LS.out, JSON.stringify(OUT));
+const saveDev = () => lsSet(LS.dev, JSON.stringify(DEV));
+const isAdmin = () => AUTH && AUTH.role === 'admin';
+const S = () => CACHE.settings;
+
+/* ---------- local view = server copy + waiting changes ---------- */
+function applyLocal(entries, settings, ops) {
+  const list = entries.map(x => ({ ...x })), st = { ...settings }, now = Date.now();
+  const role = AUTH ? AUTH.role : 'payer';
+  for (const op of ops) {
+    const i = list.findIndex(x => x.id === op.id);
+    if (op.op === 'add' && i < 0) list.push({ id: op.id, type: op.type, amount: op.type === 'miss' ? 0 : op.amount, date: op.date, note: op.note || '', status: role === 'admin' || op.type === 'miss' ? 'ok' : 'pending', by: role, reason: '', created: op.t || now, updated: op.t || now, local: true });
+    else if (op.op === 'edit' && i >= 0) { const x = list[i]; if (op.date) x.date = op.date; if (op.amount && x.type !== 'miss') x.amount = op.amount; if (op.note !== undefined) x.note = op.note; if (role === 'payer' && x.type !== 'miss') { x.status = 'pending'; x.reason = ''; } x.local = true; }
+    else if (op.op === 'del' && i >= 0) list.splice(i, 1);
+    else if (op.op === 'status' && i >= 0) { list[i].status = op.status; list[i].reason = op.status === 'rejected' ? (op.reason || '') : ''; list[i].local = true; }
+    else if (op.op === 'settings') Object.assign(st, op.data);
+  }
+  list.sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : a.created - b.created);
+  return { entries: list, settings: cleanSettings(st) };
+}
+let VIEW = { entries: [], settings: { ...DEF_SETTINGS } };
+const refreshView = () => { VIEW = applyLocal(CACHE.entries, CACHE.settings, OUT); };
+
+/* ---------- stats ---------- */
+const BADGES = [
+  { k: 'first', t: '🌱 Lần đầu', ok: s => s.payDays >= 1 },
+  { k: 's3', t: '🔥 Chuỗi 3', streak: 3 },
+  { k: 's7', t: '🌿 Chuỗi 7', streak: 7 },
+  { k: 's14', t: '🌳 Chuỗi 14', streak: 14 },
+  { k: 's30', t: '⛰ Chuỗi 30', streak: 30 },
+  { k: 'm1', t: '💯 1 triệu', amt: 1e6 },
+  { k: 'm3', t: '✨ 3 triệu', amt: 3e6 },
+  { k: 'm5', t: '🏮 5 triệu', amt: 5e6 },
+  { k: 'half', t: '🌗 Nửa chặng', ok: s => s.advanced > 0 && s.repaid * 2 >= s.advanced },
+  { k: 'done', t: '🏁 Về đích', ok: s => s.advanced > 0 && s.repaid >= s.advanced }
+];
+function stats() {
+  const E = VIEW.entries, st = VIEW.settings, today = todayKey();
+  const day = {}; let advanced = 0, repaid = 0, pending = 0, minDate = '';
+  for (const x of E) {
+    if (!minDate || x.date < minDate) minDate = x.date;
+    if (x.status === 'rejected') continue;
+    const d = day[x.date] || (day[x.date] = { ok: 0, pend: 0, miss: [], n: 0 });
+    if (x.type === 'advance' && x.status === 'ok') advanced += x.amount;
+    if (x.type === 'repay') {
+      if (x.status === 'ok') { repaid += x.amount; d.ok += x.amount; } else { pending += x.amount; d.pend += x.amount; }
+      d.n++;
+    }
+    if (x.type === 'miss') d.miss.push(x.note || '');
+  }
+  const start = st.start || minDate || today;
+  const paid = k => !!(day[k] && day[k].ok + day[k].pend > 0);
+  const todayPaid = paid(today);
+  let cur = 0;
+  for (let k = todayPaid ? today : addDays(today, -1); k >= start && paid(k); k = addDays(k, -1)) cur++;
+  let best = 0, run = 0, missed = 0, payDays = 0, guard = 0;
+  for (let k = start; k <= today && guard < 4000; k = addDays(k, 1), guard++) {
+    if (paid(k)) { run++; payDays++; best = Math.max(best, run); } else { run = 0; if (k < today) missed++; }
+  }
+  const mStart = today.slice(0, 8) + '01', from = start > mStart ? start : mStart;
+  let mPaid = 0, mDays = 0, mSum = 0;
+  for (let k = from; k <= today && mDays < 40; k = addDays(k, 1)) { mDays++; if (paid(k)) mPaid++; mSum += day[k] ? day[k].ok + day[k].pend : 0; }
+  const owed = advanced - repaid;
+  const okDays = Object.values(day).filter(d => d.ok > 0).length;
+  return {
+    day, start, today, todayPaid, todayAmt: day[today] ? day[today].ok + day[today].pend : 0, todayPend: day[today] ? day[today].pend : 0,
+    cur, best, missed, payDays, mPaid, mDays, mSum, advanced, repaid, pending, owed,
+    avg: okDays ? Math.round(repaid / okDays) : 0,
+    daysLeft: owed > 0 ? Math.ceil(owed / st.target) : 0,
+    pct: advanced > 0 ? Math.min(100, repaid / advanced * 100) : 0
+  };
+}
+const badgeOn = (b, s) => b.ok ? b.ok(s) : b.streak ? s.best >= b.streak : s.repaid >= b.amt;
+
+/* ---------- theme & header ---------- */
+function pickTheme() {
+  const names = Object.keys(THEMES);
+  UI.theme = DEV.theme || names[Math.floor(Math.random() * names.length)];
+  const T = THEMES[UI.theme], r = document.documentElement.style;
+  r.setProperty('--ac', T.ac); r.setProperty('--ac2', T.ac2);
+  r.setProperty('--acl', mix(T.ac, '#ffffff', .45)); r.setProperty('--acs', mix(T.ac, '#ffffff', .88));
+  const meta = document.querySelector('meta[name=theme-color]'); if (meta) meta.content = T.ridges[3];
+}
+function drawHeader() {
+  const now = NOW(), phase = phaseOf(now.getHours()), key = UI.theme + phase;
+  UI.phase = phase;
+  if (UI.sceneKey !== key) { $('#scene').src = sceneURL(UI.theme, phase); UI.sceneKey = key; }
+  $('#hd').classList.toggle('dark', phase === 'dusk' || phase === 'night');
+  $('#hdSub').textContent = WD[now.getDay()] + ', ' + now.getDate() + '/' + (now.getMonth() + 1) + ' · ' + hhmm(now);
+}
+
+/* ---------- render ---------- */
+function card(inner, cls = '') { return `<div class="card ${cls}">${inner}</div>`; }
+
+function bannerHtml() {
+  let h = '';
+  if (!STORAGE_OK) h += `<div class="banner red">Điện thoại đang chặn bộ nhớ của trang, dữ liệu có thể không được lưu. Hãy mở trang bằng Chrome thường (không ẩn danh).</div>`;
+  if (SY.st === 'key') h += `<div class="banner red">Link này không còn dùng được nữa. Nhờ ${esc(S().admin)} gửi link mới nhé.</div>`;
+  if (SY.st === 'pin') h += `<div class="banner red">Mã PIN không còn đúng. <button class="link" data-act="relogin">Nhập lại PIN</button></div>`;
+  if (SY.st === 'locked') h += `<div class="banner red">${esc(SY.msg)}</div>`;
+  if (SY.st === 'setup') h += `<div class="banner red">${esc(SY.msg)}</div>`;
+  if (OUT.length && SY.st === 'offline') h += `<div class="banner">Đang ngoại tuyến · ${OUT.length} thay đổi sẽ tự gửi khi có mạng.</div>`;
+  return h;
+}
+
+function owedCard(s) {
+  const st = VIEW.settings;
+  if (s.advanced > 0 && s.owed <= 0) return card(`<div class="lbl">${esc(cap(st.payer))}</div><div class="big">Đã trả xong 🏁</div><div class="row"><span>Tổng đã trả</span><b>${money(s.repaid)}</b></div>`);
+  return card(`<div class="lbl">${esc(cap(st.payer))} còn nợ</div><div class="big mono-num">${money(Math.max(0, s.owed))}</div>
+    <div class="bar"><i style="width:${s.pct.toFixed(1)}%"></i></div>
+    <div class="row"><span>Đã trả ${money(s.repaid)} / ${money(s.advanced)}</span><b>${s.pct.toFixed(1).replace('.', ',')}%</b></div>
+    ${s.pending ? `<div class="row"><span>Đang chờ xác nhận</span><b>${money(s.pending)}</b></div>` : ''}
+    ${s.daysLeft ? `<div class="row"><span class="muted">≈ ${s.daysLeft} ngày nữa nếu mỗi ngày ${short(st.target)}</span></div>` : ''}`);
+}
+
+function nextBadgeHint(s) {
+  const b = BADGES.find(b => b.streak && !badgeOn(b, s));
+  if (!b) return '';
+  const need = b.streak - s.cur;
+  return need > 0 && s.cur > 0 ? `Còn ${need} ngày liên tiếp nữa để đạt ${b.t}` : '';
+}
+
+function streakCard(s, withCal) {
+  const st = VIEW.settings, admin = isAdmin();
+  let msg;
+  if (admin) msg = s.todayPaid ? `Hôm nay đã trả ${money(s.todayAmt)}${s.todayPend ? ' (chờ xác nhận)' : ''}` : 'Hôm nay chưa thấy khoản trả';
+  else if (s.todayPaid) msg = s.todayPend && s.todayPend === s.todayAmt ? `Đã gửi ${money(s.todayAmt)}, chờ ${st.admin} xác nhận` : 'Hôm nay xong rồi, cảm ơn anh! 🎉';
+  else if (s.cur > 0) msg = `Chuyển hôm nay để giữ chuỗi ${s.cur} ngày`;
+  else msg = 'Bắt đầu chuỗi mới từ hôm nay 🌱';
+  const hint = admin ? '' : nextBadgeHint(s);
+  return card(`<div class="streak"><div class="fl">🔥${s.cur}</div><div class="sp"><div class="msg">${esc(msg)}</div>
+      <div class="sm">Chuỗi ${s.cur} ngày · kỷ lục ${s.best} · tháng này ${s.mPaid}/${s.mDays} ngày</div></div></div>
+    ${hint ? `<div class="celebrate">${esc(hint)}</div>` : ''}
+    ${withCal ? calendarHtml(s) : ''}`);
+}
+
+function calendarHtml(s) {
+  const today = s.today, curM = today.slice(0, 7), startM = s.start.slice(0, 7);
+  if (!UI.cal || UI.cal > curM) UI.cal = curM;
+  if (UI.cal < startM) UI.cal = startM;
+  const [y, m] = UI.cal.split('-').map(Number);
+  const first = new Date(y, m - 1, 1), nDays = new Date(y, m, 0).getDate(), lead = (first.getDay() + 6) % 7;
+  let h = ['T2', 'T3', 'T4', 'T5', 'T6', 'T7', 'CN'].map(w => `<div class="w">${w}</div>`).join('');
+  for (let i = 0; i < lead; i++) h += '<div></div>';
+  const target = VIEW.settings.target;
+  for (let d = 1; d <= nDays; d++) {
+    const k = UI.cal + '-' + String(d).padStart(2, '0'), x = s.day[k];
+    let c = 'd';
+    if (k < s.start) c = 'pre';
+    else if (x && x.ok >= target) c = 'full';
+    else if (x && x.ok > 0) c = 'part';
+    else if (x && x.pend > 0) c = 'pend';
+    else if (k < today) c = 'miss';
+    if (x && x.miss.length) c += ' nt';
+    if (k === today) c += ' td';
+    h += `<button class="${c}" data-act="day" data-k="${k}" aria-label="${fmtDay(k)}">${d}</button>`;
+  }
+  return `<div class="calh"><b>Tháng ${m}${y !== NOW().getFullYear() ? '/' + y : ''}</b><div class="nav">
+      <button data-act="calPrev" ${UI.cal <= startM ? 'disabled' : ''} aria-label="Tháng trước">‹</button>
+      <button data-act="calNext" ${UI.cal >= curM ? 'disabled' : ''} aria-label="Tháng sau">›</button></div></div>
+    <div class="cal">${h}</div>
+    <div class="leg"><span><i style="background:var(--ac)"></i>Đủ ${short(target)}</span><span><i style="background:var(--acl)"></i>Ít hơn</span><span><i style="background:var(--acs);outline:1px dashed var(--acl)"></i>Chờ xác nhận</span><span><i style="background:var(--badl)"></i>Bỏ lỡ</span></div>`;
+}
+
+function badgesCard(s) {
+  return card(`<div class="lbl">Huy hiệu · ${BADGES.filter(b => badgeOn(b, s)).length}/${BADGES.length}</div>
+    <div class="badges">${BADGES.map(b => `<span class="badge ${badgeOn(b, s) ? '' : 'off'}">${b.t}</span>`).join('')}</div>`);
+}
+
+function chartSvg(s) {
+  const st = VIEW.settings, today = s.today;
+  let keys = [];
+  const from = UI.range === 0 ? s.start : addDays(today, -(UI.range - 1));
+  for (let k = from, i = 0; k <= today && i < 4000; k = addDays(k, 1), i++) keys.push(k);
+  let bins = keys.map(k => ({ k, ok: s.day[k] ? s.day[k].ok : 0, pend: s.day[k] ? s.day[k].pend : 0, lab: k }));
+  let target = st.target, weekly = false;
+  if (bins.length > 45) {                     // long ranges: one bar per week
+    weekly = true; target = st.target * 7;
+    const w = [];
+    for (const b of bins) {
+      const d = parseKey(b.k), mon = addDays(b.k, -((d.getDay() + 6) % 7));
+      if (!w.length || w[w.length - 1].lab !== mon) w.push({ ok: 0, pend: 0, lab: mon });
+      w[w.length - 1].ok += b.ok; w[w.length - 1].pend += b.pend;
+    }
+    bins = w;
+  }
+  const W = 340, H = 130, n = bins.length || 1, bw = W / n;
+  const mx = Math.max(target * 1.5, ...bins.map(b => b.ok + b.pend)) || 1;
+  const y = v => H - v / mx * H;
+  let svg = `<svg viewBox="0 0 ${W} ${H + 20}" role="img" aria-label="Biểu đồ khoản trả">`;
+  svg += `<line x1="0" x2="${W}" y1="${y(target).toFixed(1)}" y2="${y(target).toFixed(1)}" stroke="var(--ac2)" stroke-dasharray="4 4" stroke-width="1"/>`;
+  bins.forEach((b, i) => {
+    const x = i * bw + bw * .17, w = Math.max(1.5, bw * .66);
+    if (b.ok) svg += `<rect x="${x.toFixed(1)}" y="${y(b.ok).toFixed(1)}" width="${w.toFixed(1)}" height="${(H - y(b.ok)).toFixed(1)}" rx="2" fill="var(--ac)"/>`;
+    if (b.pend) { const top = b.ok + b.pend; svg += `<rect x="${x.toFixed(1)}" y="${y(top).toFixed(1)}" width="${w.toFixed(1)}" height="${(y(b.ok) - y(top)).toFixed(1)}" rx="2" fill="var(--acl)" opacity=".7"/>`; }
+    if (!b.ok && !b.pend) svg += `<rect x="${x.toFixed(1)}" y="${H - 3}" width="${w.toFixed(1)}" height="3" rx="1" fill="#E3DDD1"/>`;
+    const every = n <= 10 ? 1 : n <= 31 ? 5 : Math.ceil(n / 6);
+    if ((n - 1 - i) % every === 0) svg += `<text x="${Math.min(W - 14, Math.max(14, x + w / 2)).toFixed(1)}" y="${H + 14}" text-anchor="middle" font-size="9" fill="#8A8F96">${fmtDay(b.lab)}</text>`;
+  });
+  svg += `<text x="2" y="${(y(target) - 4).toFixed(1)}" font-size="10" fill="var(--ac2)">${short(target)}${weekly ? '/tuần' : ''}</text>`;
+  return svg + '</svg>';
+}
+function chartCard(s) {
+  const r = UI.range;
+  const sel = [[7, '7 ngày'], [30, '30 ngày'], [0, 'Tất cả']].map(([v, t]) => `<button class="${r === v ? 'on' : ''}" data-act="range" data-v="${v}">${t}</button>`).join('');
+  let sum = 0, cnt = 0;
+  const from = r === 0 ? s.start : addDays(s.today, -(r - 1));
+  for (let k = from, i = 0; k <= s.today && i < 4000; k = addDays(k, 1), i++) { cnt++; if (s.day[k]) sum += s.day[k].ok + s.day[k].pend; }
+  return card(`<div class="hrow"><div class="lbl">Mỗi ngày</div><div class="seg">${sel}</div></div>
+    <div class="chart">${chartSvg(s)}</div>
+    <div class="leg"><span><i style="background:var(--ac)"></i>Đã xác nhận</span><span><i style="background:var(--acl)"></i>Chờ xác nhận</span><span><i style="background:var(--ac2)"></i>Mục tiêu</span></div>
+    <div class="stats3"><div><b>${short(sum)}</b><span>tổng ${r ? r + ' ngày' : 'từ đầu'}</span></div><div><b>${short(cnt ? Math.round(sum / cnt) : 0)}</b><span>TB mỗi ngày</span></div><div><b>${s.missed}</b><span>ngày bỏ lỡ</span></div></div>`);
+}
+
+const STATUS_TXT = { pending: 'Chờ xác nhận', ok: 'Đã nhận', rejected: 'Bị từ chối' };
+function entryRow(x, tap) {
+  const st = VIEW.settings;
+  let chip, title, sub = fmtDayLong(x.date) + (x.created ? ' · ' + hhmm(x.created) : '');
+  if (x.type === 'advance') { chip = `<span class="chip c-adv">${esc(st.admin)} ứng</span>`; title = money(x.amount); }
+  else if (x.type === 'miss') { chip = `<span class="chip c-miss">Không trả được</span>`; title = ''; }
+  else { chip = `<span class="chip c-${x.status}">${STATUS_TXT[x.status]}</span>`; title = money(x.amount); }
+  if (x.note) sub += ' · ' + x.note;
+  if (x.status === 'rejected' && x.reason) sub += ' · Lý do: ' + x.reason;
+  if (x.local) sub += ' · chưa gửi';
+  const inner = `<div class="t">${title ? `<div class="amt">${title}</div>` : ''}<div class="s">${esc(sub)}</div></div>${chip}`;
+  return tap ? `<button class="item tapr" data-act="edit" data-id="${esc(x.id)}">${inner}</button>` : `<div class="item">${inner}</div>`;
+}
+function canPayerChange(x) { return x.by === 'payer' && (x.type === 'miss' || x.status !== 'ok'); }
+
+function pendingCard() {
+  const P = VIEW.entries.filter(x => x.type === 'repay' && x.status === 'pending').reverse();
+  if (!P.length) return '';
+  return card(`<div class="hrow"><div class="lbl">Chờ ${esc(VIEW.settings.admin)} xác nhận · ${P.length}</div>${P.length > 1 ? `<button class="link" data-act="okAll">Nhận tất cả</button>` : ''}</div>
+    <div class="list">${P.map(x => `<div class="item"><button class="t tapr" data-act="edit" data-id="${esc(x.id)}"><div class="amt">${money(x.amount)}</div>
+      <div class="s">${esc(fmtDayLong(x.date) + (x.created ? ' · ' + hhmm(x.created) : '') + (x.note ? ' · ' + x.note : ''))}</div></button>
+      <button class="rb no" data-act="reject" data-id="${esc(x.id)}" aria-label="Từ chối">✕</button>
+      <button class="rb ok" data-act="ok" data-id="${esc(x.id)}" aria-label="Xác nhận">✓</button></div>`).join('')}</div>`);
+}
+
+function historyCard(admin) {
+  let L = VIEW.entries.slice().reverse();
+  if (admin) {
+    const f = UI.filter;
+    if (f !== 'all') L = L.filter(x => x.type === f);
+  }
+  const shown = L.slice(0, admin ? UI.more : UI.pmore);
+  const seg = admin ? `<div class="seg">${[['all', 'Tất cả'], ['repay', 'Trả'], ['advance', 'Ứng'], ['miss', 'Ghi chú']].map(([v, t]) => `<button class="${UI.filter === v ? 'on' : ''}" data-act="filter" data-v="${v}">${t}</button>`).join('')}</div>` : '';
+  const can = x => admin || canPayerChange(x);
+  return card(`<div class="hrow"><div class="lbl">${admin ? 'Lịch sử' : 'Gần đây'}</div>${seg}</div>
+    <div class="list">${shown.length ? shown.map(x => entryRow(x, can(x))).join('') : '<div class="empty">Chưa có gì</div>'}</div>
+    ${L.length > shown.length ? `<button class="btn g s" data-act="more">Xem thêm (${L.length - shown.length})</button>` : ''}`);
+}
+
+function payerHome(s) {
+  const st = VIEW.settings;
+  const btnTxt = s.todayPaid ? '+ Ghi thêm khoản đã chuyển' : `+ Đã chuyển ${money(st.target)} hôm nay`;
+  return bannerHtml() + streakCard(s, true) +
+    `<button class="btn" data-act="pay" style="margin-bottom:8px">${esc(btnTxt)}</button>` +
+    (s.todayPaid ? '' : `<div style="text-align:center;margin-bottom:12px"><button class="link" data-act="miss">Hôm nay chưa trả được</button></div>`) +
+    badgesCard(s) + owedCard(s) + chartCard(s) + historyCard(false);
+}
+function adminHome(s) {
+  return bannerHtml() + owedCard(s) + pendingCard() + streakCard(s, false) + chartCard(s) +
+    card(`<div class="lbl">Lịch trả</div>${calendarHtml(s)}`) + badgesCard(s) + historyCard(true);
+}
+function welcomeHtml() {
+  const file = !/^https?:$/.test(location.protocol);
+  return card(`<div class="welcome"><div class="big" style="font-size:24px">Chào bạn 👋</div>
+    <p>Anh Trường: hãy mở bằng <b>link Mẫn gửi</b> để bắt đầu ghi khoản trả.</p>
+    <p>Mẫn: nhập mã PIN quản lý một lần trên máy này.</p>
+    ${file ? `<div class="fld"><label>Địa chỉ trang</label><input class="in" id="wSrv" inputmode="url" autocomplete="off" placeholder="https://tra-no.….workers.dev" value="${esc(AUTH && AUTH.server || '')}"></div>` : ''}
+    <div class="fld"><label>Mã PIN quản lý</label><input class="in" id="wPin" type="password" inputmode="numeric" maxlength="8" autocomplete="off" placeholder="4 chữ số"></div>
+    <div class="err" id="wErr"></div>
+    <div class="btns"><button class="btn" data-act="login">Đăng nhập quản lý</button></div></div>`);
+}
+
+function render() {
+  drawHeader();
+  setDot();
+  refreshView();
+  const app = $('#app');
+  $('#fab').classList.toggle('hidden', !isAdmin());
+  if (!AUTH) { app.innerHTML = bannerHtml() + welcomeHtml(); return; }
+  const s = stats();
+  app.innerHTML = isAdmin() ? adminHome(s) : payerHome(s);
+}
+let renderFailed = false;
+function safeRender() {
+  try { render(); renderFailed = false; }
+  catch (e) {
+    logDiag('render: ' + (e && e.stack || e));
+    if (renderFailed) return; renderFailed = true;
+    $('#app').innerHTML = card(`<div class="msg">Có lỗi khi hiển thị…</div><p class="sm" style="margin-top:6px">Dữ liệu vẫn an toàn. Bạn có thể sao lưu ngay hoặc tải lại trang.</p>
+      <div class="btns"><button class="btn" data-act="export">Sao lưu</button><button class="btn g" data-act="reload">Tải lại</button></div>`);
+  }
+}
+
+/* ---------- toast ---------- */
+let toastT = 0;
+function toast(msg, ms = 2200) { const t = $('#toast'); t.textContent = msg; t.classList.add('on'); clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove('on'), ms); }
+
+/* ---------- sheets + back gesture ---------- */
+let SHEET = null, lastBack = 0, HIST = true;
+/* Each open sheet owns one history entry, so the phone's Back gesture closes it.
+   Closing from a button goes back one entry; a sheet opened while that is still
+   in flight waits for it before adding its own entry. */
+const NAV = { closing: false, queued: false, timer: 0 };
+function hist(fn) { try { fn(); return true; } catch (e) { HIST = false; return false; } }
+const histState = () => { try { return history.state; } catch (e) { return null; } };
+function openSheet(html, bind) {
+  const sh = $('#sheet');
+  sh.innerHTML = `<div class="grab"></div>` + html;
+  if (!SHEET) {
+    SHEET = { pushed: false };
+    if (NAV.closing) { NAV.queued = true; SHEET.pushed = true; }
+    else SHEET.pushed = hist(() => history.pushState({ trn: 'sheet' }, ''));
+    $('#scrim').classList.remove('hidden'); sh.classList.remove('hidden');
+    requestAnimationFrame(() => { if (SHEET) { $('#scrim').classList.add('on'); sh.classList.add('on'); } });
+  }
+  sh.scrollTop = 0;
+  if (bind) bind(sh);
+}
+function hideSheetDom() {
+  if (!SHEET) return;
+  SHEET = null;
+  const sh = $('#sheet');
+  if (document.activeElement && sh.contains(document.activeElement)) document.activeElement.blur();
+  $('#scrim').classList.remove('on'); sh.classList.remove('on');
+  setTimeout(() => { if (!SHEET) { $('#scrim').classList.add('hidden'); sh.classList.add('hidden'); sh.innerHTML = ''; } }, DEV.lite ? 0 : 230);
+  if (pendingRender) { pendingRender = false; safeRender(); }
+}
+function navDone() {
+  NAV.closing = false; clearTimeout(NAV.timer);
+  if (NAV.queued) { NAV.queued = false; if (SHEET) SHEET.pushed = hist(() => history.pushState({ trn: 'sheet' }, '')); }
+}
+function closeSheet() {
+  if (!SHEET) return;
+  const pushed = SHEET.pushed && !NAV.queued, st = histState();
+  if (NAV.queued) NAV.queued = false;
+  hideSheetDom();
+  if (pushed && st && st.trn === 'sheet' && !NAV.closing) {
+    NAV.closing = true;
+    if (!hist(() => history.back())) { navDone(); return; }
+    NAV.timer = setTimeout(navDone, 700);
+  }
+}
+function setupBackGuard() {
+  hist(() => { history.replaceState({ trn: 'base' }, ''); history.pushState({ trn: 'guard' }, ''); });
+  window.addEventListener('popstate', e => {
+    const st = e.state;
+    if (NAV.closing) { navDone(); return; }
+    if (SHEET) { hideSheetDom(); if (st && st.trn === 'base') hist(() => history.pushState({ trn: 'guard' }, '')); return; }
+    if (st && st.trn === 'guard') return;
+    const now = Date.now();
+    if (now - lastBack < 2500) { hist(() => history.back()); return; }
+    lastBack = now;
+    toast('Vuốt lại lần nữa để thoát');
+    hist(() => history.pushState({ trn: 'guard' }, ''));
+  });
+}
+
+/* ---------- sheets: forms ---------- */
+const CHIPS = [50000, 100000, 150000, 200000, 300000];
+/* Encouragement while the payer types. Ranges follow the daily target T:
+   below T · exactly T · up to T+100k · up to T+350k · T+350k and more (150k target -> 150 / 250 / 500k). */
+function cheerText(total) {
+  const T = VIEW.settings.target;
+  if (!(total > 0)) return '';
+  if (total < T) return 'Hôm nay cố tới đây. Mai sẽ nhiều hơn 💪';
+  if (total === T) return 'Đúng mục tiêu hôm nay ✓';
+  if (total < T + 100000) return 'Tuyệt, tiếp tục cố gắng!';
+  if (total < T + 350000) return 'Cứ đà này sẽ tốt lên!';
+  return 'Quá đỉnh! Cảm ơn anh nhiều 🎉';
+}
+const dayRepayTotal = (date, exclId) => VIEW.entries.filter(x => x.type === 'repay' && x.status !== 'rejected' && x.date === date && x.id !== exclId).reduce((a, x) => a + x.amount, 0);
+function amountField(val) {
+  return `<div class="fld"><label>Số tiền</label><input class="in amt" name="amt" inputmode="numeric" autocomplete="off" value="${val ? esc(String(val).replace(/\B(?=(\d{3})+(?!\d))/g, '.')) : ''}" placeholder="150.000">
+    <div class="sm" id="amtHint" style="margin-top:4px">&nbsp;</div><div class="celebrate hidden" id="cheer" style="margin-top:6px"></div>
+    <div class="chips">${CHIPS.map(c => `<button type="button" data-chip="${c}" class="${c === val ? 'on' : ''}">${short(c)}</button>`).join('')}</div></div>`;
+}
+function bindAmount(sh) {
+  const inp = sh.querySelector('[name=amt]'); if (!inp) return;
+  const box = sh.querySelector('#cheer'), dateIn = sh.querySelector('[name=date]');
+  const upd = () => {
+    const v = parseAmount(inp.value);
+    let hint = inp.value ? (v ? '= ' + money(v) : 'Số tiền chưa hợp lệ') : ' ', msg = '';
+    if (v && sh.dataset.cheer) {
+      const prev = dayRepayTotal(dateIn ? dateIn.value : todayKey(), sh.dataset.excl);
+      if (prev) hint += ' · cả ngày ' + money(prev + v);
+      msg = cheerText(prev + v);
+    }
+    sh.querySelector('#amtHint').textContent = hint;
+    if (box) { box.textContent = msg; box.classList.toggle('hidden', !msg); }
+    sh.querySelectorAll('[data-chip]').forEach(b => b.classList.toggle('on', +b.dataset.chip === v));
+  };
+  inp.addEventListener('input', upd);
+  if (dateIn) dateIn.addEventListener('change', upd);
+  sh.querySelectorAll('[data-chip]').forEach(b => b.addEventListener('click', () => { inp.value = String(b.dataset.chip).replace(/\B(?=(\d{3})+(?!\d))/g, '.'); upd(); }));
+  upd();
+}
+const dateField = (val, label = 'Ngày') => `<div class="fld"><label>${label}</label><input class="in" type="date" name="date" value="${esc(val)}" max="${addDays(todayKey(), 1)}"></div>`;
+const noteField = (val, ph = 'Ghi chú (không bắt buộc)', label = 'Ghi chú') => `<div class="fld"><label>${label}</label><input class="in" name="note" maxlength="200" autocomplete="off" value="${esc(val || '')}" placeholder="${esc(ph)}"></div>`;
+function readForm(sh, needAmt) {
+  const err = sh.querySelector('.err');
+  const date = sh.querySelector('[name=date]').value;
+  if (!isDate(date)) { err.textContent = 'Chọn ngày hợp lệ.'; return null; }
+  if (date > addDays(todayKey(), 1)) { err.textContent = 'Không ghi được ngày trong tương lai.'; return null; }
+  let amount = 0;
+  if (needAmt) { amount = parseAmount(sh.querySelector('[name=amt]').value); if (!amount) { err.textContent = 'Nhập số tiền (ít nhất 1.000đ).'; return null; } }
+  const n = sh.querySelector('[name=note]');
+  return { date, amount, note: n ? n.value.trim().slice(0, 200) : '' };
+}
+
+function paySheet(date) {
+  const st = VIEW.settings;
+  openSheet(`<h3>Ghi khoản đã chuyển</h3><p class="sm">${esc(st.admin)} sẽ xác nhận khi nhận được tiền.</p>
+    ${amountField(st.target)}${dateField(date || todayKey(), 'Ngày chuyển')}${noteField('', 'VD: chuyển khoản MB')}
+    <div class="err"></div><div class="btns"><button class="btn g" data-act="close">Huỷ</button><button class="btn" data-act="paySave">Gửi</button></div>`, sh => { if (!isAdmin()) sh.dataset.cheer = '1'; bindAmount(sh); });
+}
+function missSheet(date) {
+  openSheet(`<h3>Hôm nay chưa trả được</h3><p class="sm">Ghi lại lý do để ${esc(VIEW.settings.admin)} biết. Ngày mai cố gắng nhé!</p>
+    ${dateField(date || todayKey())}${noteField('', 'VD: ế khách, xe hư…', 'Lý do')}
+    <div class="err"></div><div class="btns"><button class="btn g" data-act="close">Huỷ</button><button class="btn" data-act="missSave">Lưu</button></div>`);
+}
+function addSheet(type = 'repay') {
+  const st = VIEW.settings;
+  openSheet(`<h3>Thêm khoản</h3><div class="seg" id="addType">
+      <button class="${type === 'repay' ? 'on' : ''}" data-t="repay">${esc(cap(st.payer))} trả</button>
+      <button class="${type === 'advance' ? 'on' : ''}" data-t="advance">${esc(st.admin)} ứng thêm</button>
+      <button class="${type === 'miss' ? 'on' : ''}" data-t="miss">Ghi chú ngày</button></div>
+    <div id="addAmt" class="${type === 'miss' ? 'hidden' : ''}">${amountField(type === 'repay' ? st.target : 0)}</div>
+    ${dateField(todayKey())}${noteField('')}
+    <p class="sm" style="margin-top:8px">Khoản do ${esc(st.admin)} thêm được tính là đã xác nhận.</p>
+    <div class="err"></div><div class="btns"><button class="btn g" data-act="close">Huỷ</button><button class="btn" data-act="addSave" data-t="${type}">Lưu</button></div>`, sh => {
+    bindAmount(sh);
+    sh.querySelectorAll('#addType button').forEach(b => b.addEventListener('click', () => {
+      sh.querySelectorAll('#addType button').forEach(x => x.classList.toggle('on', x === b));
+      sh.querySelector('[data-act=addSave]').dataset.t = b.dataset.t;
+      sh.querySelector('#addAmt').classList.toggle('hidden', b.dataset.t === 'miss');
+    }));
+  });
+}
+function editSheet(id) {
+  const x = VIEW.entries.find(e => e.id === id); if (!x) return toast('Khoản này không còn nữa');
+  const admin = isAdmin(), st = VIEW.settings;
+  if (!admin && !canPayerChange(x)) return toast('Khoản này đã được xác nhận');
+  const who = x.type === 'advance' ? `${st.admin} ứng` : x.type === 'miss' ? 'Ghi chú ngày' : `${cap(st.payer)} trả`;
+  const by = x.by === 'payer' ? cap(st.payer) : st.admin;
+  openSheet(`<h3>${esc(who)}</h3><p class="sm">Ghi bởi ${esc(by)}${x.created ? ' · ' + esc(fmtDayLong(keyOf(new Date(x.created)))) + ' ' + hhmm(x.created) : ''}${x.type === 'repay' ? ' · ' + STATUS_TXT[x.status] : ''}</p>
+    ${x.status === 'rejected' && x.reason ? `<div class="banner red" style="margin-top:10px">Lý do từ chối: ${esc(x.reason)}</div>` : ''}
+    ${x.type !== 'miss' ? amountField(x.amount) : ''}${dateField(x.date)}${noteField(x.note, '', x.type === 'miss' ? 'Lý do' : 'Ghi chú')}
+    ${admin && x.type === 'repay' ? `<div class="fld"><label>Trạng thái</label><div class="seg" id="stSel">${['pending', 'ok', 'rejected'].map(v => `<button class="${x.status === v ? 'on' : ''}" data-s="${v}">${STATUS_TXT[v]}</button>`).join('')}</div></div>` : ''}
+    ${!admin && x.status === 'rejected' ? '<p class="sm" style="margin-top:8px">Sửa và lưu lại sẽ gửi khoản này cho xác nhận lần nữa.</p>' : ''}
+    <div class="err"></div>
+    <div class="btns"><button class="btn d" data-act="delEntry" data-id="${esc(id)}">Xoá</button><button class="btn" data-act="editSave" data-id="${esc(id)}">Lưu</button></div>`, sh => {
+    if (!admin && x.type === 'repay') { sh.dataset.cheer = '1'; sh.dataset.excl = x.id; }
+    bindAmount(sh);
+    sh.querySelectorAll('#stSel button').forEach(b => b.addEventListener('click', () => sh.querySelectorAll('#stSel button').forEach(y => y.classList.toggle('on', y === b))));
+  });
+}
+function rejectSheet(id) {
+  const x = VIEW.entries.find(e => e.id === id); if (!x) return;
+  openSheet(`<h3>Từ chối ${money(x.amount)}?</h3><p class="sm">${esc(fmtDayLong(x.date))}. ${esc(cap(VIEW.settings.payer))} sẽ thấy khoản này bị từ chối và có thể sửa lại.</p>
+    ${noteField('', 'VD: chưa thấy tiền về', 'Lý do (không bắt buộc)')}
+    <div class="btns"><button class="btn g" data-act="close">Thôi</button><button class="btn d" data-act="rejectSave" data-id="${esc(id)}">Từ chối</button></div>`);
+}
+function daySheet(k) {
+  const s = stats(), L = VIEW.entries.filter(x => x.date === k), admin = isAdmin();
+  const can = x => admin || canPayerChange(x);
+  const past = k <= todayKey() && k >= s.start;
+  openSheet(`<h3>${esc(fmtDayLong(k))}${k !== todayKey() ? '' : ' · ' + fmtDay(k)}</h3>
+    <div class="list">${L.length ? L.slice().reverse().map(x => entryRow(x, can(x))).join('') : `<div class="empty">${k < s.start ? 'Trước ngày bắt đầu' : k > todayKey() ? 'Chưa tới ngày này' : 'Không có khoản trả nào'}</div>`}</div>
+    ${past ? `<div class="btns"><button class="btn g s" data-act="${admin ? 'addFor' : 'payFor'}" data-k="${k}">+ Ghi khoản trả ngày này</button>${!admin && !(s.day[k] && s.day[k].miss.length) ? `<button class="btn g s" data-act="missFor" data-k="${k}">Ghi lý do</button>` : ''}</div>` : ''}`);
+}
+
+/* ---------- settings ---------- */
+function settingsSheet() {
+  const admin = isAdmin(), st = VIEW.settings;
+  const changed = VIEW.entries.filter(x => x.updated > DEV.lastExport).length;
+  const themes = ['', ...Object.keys(THEMES)].map(t => `<button class="${DEV.theme === t ? 'on' : ''}" data-theme="${t}">${t ? THEME_NAMES[t] : 'Ngẫu nhiên'}</button>`).join('');
+  openSheet(`<h3>Cài đặt</h3>
+    <div class="sec"><div class="lbl">Đồng bộ</div><div class="row" style="margin-top:6px"><span>${esc(syncLine())}</span><button class="link" data-act="syncNow">Đồng bộ ngay</button></div>
+      <p class="sm">Máy này: ${admin ? esc(st.admin) + ' (quản lý)' : esc(cap(st.payer))}${AUTH && AUTH.server ? ' · ' + esc(AUTH.server.replace(/^https?:\/\//, '')) : ''}</p></div>
+    ${admin ? `<div class="sec"><div class="lbl">Link cho ${esc(st.payer)}</div>
+      <p class="sm" style="margin-top:6px">Gửi link này qua Zalo. ${esc(cap(st.payer))} mở một lần là dùng được, không cần PIN, và chỉ ghi được khoản "chờ xác nhận".</p>
+      <div class="btns"><button class="btn s" data-act="shareLink">Gửi link</button><button class="btn g s" data-act="newLink">Đổi link</button></div></div>
+    <div class="sec"><div class="lbl">Thiết lập</div>
+      <div class="fld"><label>Mục tiêu mỗi ngày</label><input class="in" name="sTarget" inputmode="numeric" value="${esc(String(st.target).replace(/\B(?=(\d{3})+(?!\d))/g, '.'))}"></div>
+      <div class="fld"><label>Tên người trả</label><input class="in" name="sPayer" maxlength="30" value="${esc(st.payer)}"></div>
+      <div class="fld"><label>Tên quản lý</label><input class="in" name="sAdmin" maxlength="30" value="${esc(st.admin)}"></div>
+      <div class="fld"><label>Ngày bắt đầu tính chuỗi (để trống = ngày đầu tiên có dữ liệu)</label><input class="in" type="date" name="sStart" value="${esc(st.start)}"></div>
+      <div class="err" id="sErr"></div><div class="btns"><button class="btn s" data-act="saveSettings">Lưu thiết lập</button></div></div>` : ''}
+    <div class="sec"><div class="lbl">Giao diện</div><div class="tsel">${themes}</div>
+      <div class="toggle"><span>Chế độ nhẹ (tắt hiệu ứng)</span><button class="sw ${DEV.lite ? 'on' : ''}" data-act="lite" aria-label="Chế độ nhẹ"></button></div></div>
+    <div class="sec"><div class="lbl">Sao lưu</div>
+      <p class="sm" style="margin-top:6px">${DEV.lastExport ? `Lần sao lưu cuối: ${esc(fmtDayLong(keyOf(new Date(DEV.lastExport))))} ${hhmm(DEV.lastExport)} · ${changed} thay đổi mới` : 'Chưa sao lưu lần nào'}</p>
+      <div class="btns"><button class="btn s" data-act="export">Xuất file</button><button class="btn g s" data-act="share">Chia sẻ</button></div>
+      ${admin ? `<div class="btns"><button class="btn g s" data-act="import">Nhập file…</button><button class="btn g s" data-act="csv">CSV</button></div>` : ''}</div>
+    <div class="sec"><div class="lbl">Khác</div>
+      <div class="btns"><button class="btn g s" data-act="diag">Chẩn đoán</button><button class="btn g s" data-act="logout">Đăng xuất máy này</button></div>
+      ${admin ? `<div class="btns"><button class="btn d s" data-act="erase">Xoá toàn bộ dữ liệu</button></div>` : ''}
+      <p class="sm" style="margin-top:10px">Trả dần mỗi ngày · v1</p></div>`, sh => {
+    sh.querySelectorAll('[data-theme]').forEach(b => b.addEventListener('click', () => {
+      DEV.theme = b.dataset.theme; saveDev(); pickTheme(); UI.sceneKey = ''; safeRender();
+      sh.querySelectorAll('[data-theme]').forEach(x => x.classList.toggle('on', x === b));
+    }));
+  });
+}
+
+/* ---------- sync ---------- */
+const SY = { st: 'idle', msg: '', busy: false, again: false, timer: 0, last: 0, until: 0 };
+const apiBase = () => ((AUTH && AUTH.server) || (/^https?:$/.test(location.protocol) ? location.origin : '')).replace(/\/+$/, '');
+async function api(method, path, body, auth = AUTH) {
+  const base = (auth && auth.server || (/^https?:$/.test(location.protocol) ? location.origin : '')).replace(/\/+$/, '');
+  if (!base) throw { kind: 'noserver' };
+  const ctl = typeof AbortController === 'function' ? new AbortController() : null;
+  const tm = setTimeout(() => ctl && ctl.abort(), 20000);
+  const headers = {};
+  if (auth.role === 'admin') headers['X-Pin'] = auth.pin; else headers['X-Key'] = auth.key;
+  if (body) headers['Content-Type'] = 'application/json';
+  let r;
+  try { r = await fetch(base + '/api/' + path, { method, headers, body: body ? JSON.stringify(body) : undefined, cache: 'no-store', signal: ctl ? ctl.signal : undefined }); }
+  catch (e) { throw { kind: 'net' }; }
+  finally { clearTimeout(tm); }
+  let j = null; try { j = await r.json(); } catch (e) { /* not json */ }
+  if (r.status === 401) throw { kind: j && j.error === 'key' ? 'key' : 'pin', left: j && j.triesLeft };
+  if (r.status === 429) throw { kind: 'locked', wait: (j && j.retryIn) || 900 };
+  if (!r.ok || !j) throw { kind: j && j.error === 'setup' ? 'setup' : 'server', msg: (j && (j.detail || j.error)) || ('HTTP ' + r.status) };
+  return j;
+}
+function errText(e) {
+  return ({
+    net: 'Không kết nối được. Thay đổi được giữ trên máy này.',
+    pin: 'Mã PIN không đúng.' + (e.left > 0 ? ` Còn ${e.left} lần thử.` : ''),
+    key: 'Link không còn dùng được.',
+    locked: `Nhập sai quá nhiều lần. Tạm khoá ${Math.ceil((e.wait || 900) / 60)} phút.`,
+    setup: 'Trang chưa cài xong: ' + (e.msg || ''),
+    noserver: 'Cần nhập địa chỉ trang.',
+    server: 'Máy chủ gặp lỗi (' + (e.msg || '') + '). Sẽ thử lại.'
+  })[e && e.kind] || 'Đồng bộ lỗi.';
+}
+const OP_ERR = { locked: 'Khoản này đã được xác nhận nên không sửa được nữa.', forbidden: 'Bạn không có quyền làm việc này.', date: 'Ngày không hợp lệ.', future: 'Không ghi được ngày trong tương lai.', amount: 'Số tiền không hợp lệ.', bad: 'Có một thay đổi không hợp lệ.' };
+function syncLine() {
+  if (!AUTH) return 'Chưa đăng nhập';
+  if (SY.st === 'busy') return 'Đang đồng bộ…';
+  if (SY.st === 'ok') return 'Đã đồng bộ · ' + (SY.last ? hhmm(SY.last) : '');
+  if (SY.st === 'offline') return 'Ngoại tuyến' + (OUT.length ? ` · ${OUT.length} thay đổi đang chờ` : '');
+  return SY.msg || 'Chưa đồng bộ';
+}
+function setDot() {
+  const d = $('#sdot'); if (!d) return;
+  const map = { ok: 's-ok', busy: 's-busy', offline: 's-offline', idle: 's-offline' };
+  d.className = 'sdot ' + (map[SY.st] || 's-err'); d.classList.toggle('hidden', !AUTH); d.title = syncLine();
+}
+function setSync(st, msg = '') { const was = SY.st; SY.st = st; SY.msg = msg; setDot(); if (was !== st && ['key', 'pin', 'locked', 'setup', 'offline', 'ok'].includes(st) || ['key', 'pin', 'locked', 'setup'].includes(was)) requestRender(); }
+function schedSync(ms = 800) { clearTimeout(SY.timer); SY.timer = setTimeout(syncNow, ms); }
+let pendingRender = false;
+function requestRender() {
+  const a = document.activeElement;
+  if (a && /INPUT|TEXTAREA/.test(a.tagName) && $('#app').contains(a)) { pendingRender = true; return; }
+  safeRender();
+}
+function takeSnap(r) {
+  if (!r || !Array.isArray(r.entries)) return;
+  CACHE = cleanCache({ v: r.v, settings: r.settings, entries: r.entries });
+  saveCache();
+}
+async function syncNow(manual) {
+  if (!AUTH) return;
+  if (SY.busy) { SY.again = true; return; }
+  if (!manual && (SY.st === 'key' || SY.st === 'pin')) return;
+  if (!manual && SY.st === 'locked' && Date.now() < SY.until) return;
+  if (navigator.onLine === false) { setSync('offline'); return; }
+  SY.busy = true; setSync('busy');
+  const auth = AUTH;
+  try {
+    if (OUT.length) {
+      const ops = OUT.slice(0, 200);
+      const r = await api('POST', 'op', { ops }, auth);
+      if (auth !== AUTH) return;
+      OUT.splice(0, ops.length); saveOut();
+      const errs = (r.results || []).map((x, i) => x && x.error && !(x.error === 'gone' && ['del', 'status', 'edit'].includes(ops[i].op)) ? x.error : null).filter(Boolean);
+      if (errs.length) toast(OP_ERR[errs[0]] || 'Một thay đổi không được lưu.', 3500);
+      takeSnap(r);
+      if (OUT.length) SY.again = true;
+    } else {
+      const r = await api('GET', 'data?v=' + (CACHE.v || 0), null, auth);
+      if (auth !== AUTH) return;
+      if (!r.same) takeSnap(r);
+    }
+    SY.last = Date.now();
+    setSync('ok');
+    requestRender();
+  } catch (e) {
+    if (auth !== AUTH) return;
+    if (e && e.kind === 'locked') SY.until = Date.now() + (e.wait || 900) * 1000;
+    if (e && e.kind !== 'net') logDiag('sync: ' + (e.kind || '') + ' ' + (e.msg || e.message || ''));
+    setSync(e && e.kind === 'net' ? 'offline' : (e && e.kind) || 'server', errText(e));
+  } finally {
+    SY.busy = false;
+    if (SY.again) { SY.again = false; schedSync(300); }
+  }
+}
+function flushOnHide() {
+  if (!AUTH || SY.busy || !OUT.length || ['key', 'pin', 'locked'].includes(SY.st)) return;
+  try {
+    const body = JSON.stringify({ ops: OUT.slice(0, 200) }), base = apiBase();
+    if (body.length > 60000 || !base) return;
+    const h = { 'Content-Type': 'application/json' };
+    if (AUTH.role === 'admin') h['X-Pin'] = AUTH.pin; else h['X-Key'] = AUTH.key;
+    fetch(base + '/api/op', { method: 'POST', keepalive: true, headers: h, body }).catch(() => {});
+  } catch (e) { /* ignore */ }
+}
+function queue(op) {
+  op.t = Date.now();
+  OUT.push(op); saveOut();
+  safeRender(); schedSync(400);
+}
+
+/* ---------- export / import ---------- */
+const stamp = () => { const d = NOW(); return keyOf(d).replace(/-/g, '') + '-' + hhmm(d).replace(':', ''); };
+function backupObj() { return { app: APP_ID, v: 1, exported: new Date().toISOString(), data: { settings: VIEW.settings, entries: VIEW.entries.map(({ local, ...x }) => x) } }; }
+function markExported() { DEV.lastExport = Date.now(); saveDev(); }
+function download(name, text, type) {
+  try {
+    const url = URL.createObjectURL(new Blob([text], { type }));
+    const a = document.createElement('a'); a.href = url; a.download = name; document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+    return true;
+  } catch (e) { logDiag('download: ' + e.message); return false; }
+}
+function showText(text) {
+  openSheet(`<h3>Sao chép dữ liệu</h3><p class="sm">Không tải được file. Hãy sao chép đoạn này và lưu lại.</p><textarea class="in" style="min-height:220px;font:11px var(--mono)" readonly>${esc(text)}</textarea>
+    <div class="btns"><button class="btn" data-act="copyText">Sao chép</button></div>`);
+}
+function doExport() {
+  refreshView();
+  const text = JSON.stringify(backupObj(), null, 1);
+  if (download(`tra-no-backup-${stamp()}.json`, text, 'application/json')) { markExported(); toast('Đã xuất file sao lưu'); }
+  else showText(text);
+}
+async function doShare() {
+  refreshView();
+  const text = JSON.stringify(backupObj(), null, 1), name = `tra-no-backup-${stamp()}.json`;
+  try {
+    const f = new File([text], name, { type: 'application/json' });
+    if (navigator.canShare && navigator.canShare({ files: [f] })) { await navigator.share({ files: [f], title: 'Sao lưu Trả dần mỗi ngày' }); markExported(); return; }
+  } catch (e) { if (e && e.name === 'AbortError') return; logDiag('share: ' + e.message); }
+  doExport();
+}
+function doCsv() {
+  refreshView();
+  const st = VIEW.settings, q = s => '"' + String(s).replace(/"/g, '""') + '"';
+  const rows = [['Ngày', 'Loại', 'Số tiền', 'Trạng thái', 'Ghi chú', 'Lý do từ chối'].map(q).join(',')];
+  for (const x of VIEW.entries) rows.push([x.date, x.type === 'repay' ? cap(st.payer) + ' trả' : x.type === 'advance' ? st.admin + ' ứng' : 'Ghi chú', x.amount, x.type === 'repay' ? STATUS_TXT[x.status] : '', x.note, x.reason].map(q).join(','));
+  download(`tra-no-${stamp()}.csv`, '﻿' + rows.join('\n'), 'text/csv') ? toast('Đã xuất CSV') : showText(rows.join('\n'));
+}
+/* Accepts this app's backup, or the old "Tiến độ trả nợ" backup. */
+function parseBackup(text) {
+  let o; try { o = JSON.parse(text); } catch (e) { throw new Error('File không phải JSON hợp lệ.'); }
+  if (!o || typeof o !== 'object') throw new Error('File không đúng định dạng.');
+  if (o.app === APP_ID && o.data && typeof o.data === 'object') {
+    const entries = (Array.isArray(o.data.entries) ? o.data.entries : []).map(cleanEntry).filter(Boolean);
+    return { kind: 'Bản sao lưu Trả dần mỗi ngày', entries, settings: o.data.settings ? cleanSettings(o.data.settings) : null };
+  }
+  if (o.app && o.app !== APP_ID) throw new Error('File này là của công cụ khác (' + String(o.app).slice(0, 30) + ').');
+  if ('debt-advance-tracker-v1' in o) {
+    const arr = k => { try { const v = JSON.parse(o[k] || '[]'); return Array.isArray(v) ? v : []; } catch (e) { return []; } };
+    const tsOf = id => { const m = /^(\d{13})/.exec(String(id)); return m ? Number(m[1]) : 0; };
+    const fix = id => String(id).replace(/[^A-Za-z0-9-]/g, '').slice(0, 36);
+    const out = [];
+    for (const x of arr('debt-advance-tracker-v1')) {
+      if (!x || (x.type !== 'repay' && x.type !== 'advance')) continue;
+      const e = cleanEntry({ id: 'o' + fix(x.id), type: x.type, amount: x.amount, date: x.date, note: x.note, status: 'ok', by: x.type === 'repay' ? 'payer' : 'admin', created: tsOf(x.id), updated: tsOf(x.id) });
+      if (e) out.push(e);
+    }
+    for (const x of arr('debt-advance-tracker-late-v1')) {
+      const e = cleanEntry({ id: 'l' + fix(x && x.id), type: 'miss', amount: 0, date: x && x.date, note: x && x.note, status: 'ok', by: 'payer', created: tsOf(x && x.id), updated: tsOf(x && x.id) });
+      if (e) out.push(e);
+    }
+    return { kind: 'Bản sao lưu cũ (Tiến độ trả nợ)', entries: out, settings: null, old: true };
+  }
+  throw new Error('Không nhận ra file sao lưu này.');
+}
+function importPick() {
+  const inp = $('#file'); inp.value = '';
+  inp.onchange = async () => {
+    const f = inp.files && inp.files[0]; if (!f) return;
+    if (f.size > 3e6) return toast('File quá lớn.');
+    let B; try { B = parseBackup(await f.text()); } catch (e) { return openSheet(`<h3>Không nhập được</h3><p class="sm" style="margin-top:6px">${esc(e.message)}</p><div class="btns"><button class="btn g" data-act="close">Đóng</button></div>`); }
+    const c = t => B.entries.filter(x => x.type === t);
+    const rep = c('repay'), adv = c('advance'), miss = c('miss');
+    PENDING_IMPORT = B;
+    openSheet(`<h3>Nhập dữ liệu</h3><p class="sm">${esc(B.kind)} · ${esc(f.name)}</p>
+      <div class="row"><span>Khoản trả</span><b>${rep.length} · ${money(rep.reduce((a, x) => a + x.amount, 0))}</b></div>
+      <div class="row"><span>Khoản ứng</span><b>${adv.length} · ${money(adv.reduce((a, x) => a + x.amount, 0))}</b></div>
+      <div class="row"><span>Ghi chú ngày</span><b>${miss.length}</b></div>
+      ${B.old ? '<p class="sm" style="margin-top:10px">Danh sách việc cần làm, ghi chú vay và ngày mục tiêu của bản cũ sẽ không được nhập.</p>' : ''}
+      <p class="sm" style="margin-top:10px"><b>Gộp</b>: thêm khoản mới, giữ khoản đang có. <b>Thay thế</b>: xoá hết rồi dùng dữ liệu trong file (trên mọi máy).</p>
+      <div class="btns"><button class="btn g" data-act="impDo" data-m="replace">Thay thế</button><button class="btn" data-act="impDo" data-m="merge">Gộp</button></div>`);
+  };
+  inp.click();
+}
+let PENDING_IMPORT = null;
+async function importDo(mode) {
+  const B = PENDING_IMPORT; if (!B) return;
+  if (OUT.length) await syncNow(true);
+  try {
+    const r = await api('POST', 'admin/import', { mode, entries: B.entries, settings: B.settings || undefined });
+    PENDING_IMPORT = null;
+    takeSnap(r); closeSheet(); safeRender(); toast(`Đã nhập ${r.imported} mục`);
+  } catch (e) { toast(errText(e), 3500); }
+}
+
+/* ---------- login ---------- */
+async function login(pin, server) {
+  const err = $('#wErr') || $('#sheet .err');
+  if (!/^\d{4,8}$/.test(pin)) { if (err) err.textContent = 'PIN gồm 4–8 chữ số.'; return; }
+  if (server && !/^https?:\/\/[^\s"'<>]+$/.test(server)) { if (err) err.textContent = 'Địa chỉ trang chưa đúng (bắt đầu bằng https://).'; return; }
+  const a = { role: 'admin', pin, server: (server || '').replace(/\/+$/, '') };
+  try {
+    const r = await api('GET', 'data', null, a);
+    if (AUTH && AUTH.role !== 'admin') { CACHE = cleanCache({}); OUT = []; saveOut(); }
+    AUTH = a; saveAuth(); takeSnap(r); SY.st = 'ok'; SY.last = Date.now();
+    closeSheet(); safeRender(); toast('Xin chào ' + VIEW.settings.admin + ' 👋');
+  } catch (e) { if (err) err.textContent = errText(e); }
+}
+function pinSheet() {
+  openSheet(`<h3>Nhập lại PIN</h3><div class="fld"><label>Mã PIN quản lý</label><input class="in" id="rPin" type="password" inputmode="numeric" maxlength="8" autocomplete="off"></div>
+    <div class="err"></div><div class="btns"><button class="btn" data-act="reloginDo">Đăng nhập</button></div>`);
+}
+function takeLinkKey() {
+  const m = /[#&]k=([a-z0-9]{8,64})/.exec(location.hash || '');
+  if (!m) return;
+  hist(() => history.replaceState(null, '', location.pathname + location.search));
+  const key = m[1];
+  if (AUTH && AUTH.role === 'payer' && AUTH.key === key) return;
+  const server = /^https?:$/.test(location.protocol) ? '' : (AUTH && AUTH.server) || '';
+  if (AUTH && AUTH.role === 'admin') {
+    setTimeout(() => openSheet(`<h3>Đây là link của người trả</h3><p class="sm" style="margin-top:6px">Máy này đang đăng nhập quản lý. Chuyển máy này sang vai trò người trả?</p>
+      <div class="btns"><button class="btn g" data-act="close">Giữ quản lý</button><button class="btn" data-act="becomePayer" data-k="${key}">Chuyển</button></div>`), 300);
+    return;
+  }
+  if (AUTH && AUTH.role === 'payer' && OUT.length) { /* keep waiting changes; they belong to the same person */ }
+  AUTH = { role: 'payer', key, server }; saveAuth(); SY.st = 'idle'; SY.msg = '';
+}
+
+/* ---------- actions ---------- */
+let eraseArm = 0;
+const ACT = {
+  close: () => closeSheet(),
+  reload: () => location.reload(),
+  settings: () => settingsSheet(),
+  pay: () => paySheet(),
+  payFor: b => paySheet(b.dataset.k),
+  miss: () => missSheet(),
+  missFor: b => missSheet(b.dataset.k),
+  addFor: b => { addSheet('repay'); const d = $('#sheet [name=date]'); if (d) d.value = b.dataset.k; },
+  fab: () => addSheet('repay'),
+  day: b => daySheet(b.dataset.k),
+  calPrev: () => { const [y, m] = UI.cal.split('-').map(Number); UI.cal = keyOf(new Date(y, m - 2, 1)).slice(0, 7); safeRender(); },
+  calNext: () => { const [y, m] = UI.cal.split('-').map(Number); UI.cal = keyOf(new Date(y, m, 1)).slice(0, 7); safeRender(); },
+  range: b => { UI.range = Number(b.dataset.v); safeRender(); },
+  filter: b => { UI.filter = b.dataset.v; UI.more = 30; safeRender(); },
+  more: () => { if (isAdmin()) UI.more += 50; else UI.pmore += 20; safeRender(); },
+  edit: b => editSheet(b.dataset.id),
+  ok: b => { queue({ op: 'status', id: b.dataset.id, status: 'ok' }); toast('Đã xác nhận ✓'); },
+  okAll: () => { const P = VIEW.entries.filter(x => x.type === 'repay' && x.status === 'pending'); P.forEach(x => OUT.push({ op: 'status', id: x.id, status: 'ok', t: Date.now() })); saveOut(); safeRender(); schedSync(300); toast(`Đã xác nhận ${P.length} khoản`); },
+  reject: b => rejectSheet(b.dataset.id),
+  rejectSave: b => { const n = $('#sheet [name=note]'); queue({ op: 'status', id: b.dataset.id, status: 'rejected', reason: n ? n.value.trim().slice(0, 200) : '' }); closeSheet(); toast('Đã từ chối'); },
+  paySave: () => {
+    const f = readForm($('#sheet'), true); if (!f) return;
+    const total = dayRepayTotal(f.date) + f.amount;
+    queue({ op: 'add', id: newId('p'), type: 'repay', amount: f.amount, date: f.date, note: f.note });
+    closeSheet(); toast(isAdmin() ? 'Đã lưu' : `Đã gửi ${money(f.amount)} · ${cheerText(total)}`, 3500);
+  },
+  missSave: () => {
+    const f = readForm($('#sheet'), false); if (!f) return;
+    queue({ op: 'add', id: newId('m'), type: 'miss', amount: 0, date: f.date, note: f.note });
+    closeSheet(); toast('Đã ghi lại. Ngày mai cố lên nhé!');
+  },
+  addSave: b => {
+    const t = b.dataset.t, f = readForm($('#sheet'), t !== 'miss'); if (!f) return;
+    queue({ op: 'add', id: newId(t[0]), type: t, amount: f.amount, date: f.date, note: f.note });
+    closeSheet(); toast('Đã lưu');
+  },
+  editSave: b => {
+    const x = VIEW.entries.find(e => e.id === b.dataset.id); if (!x) return closeSheet();
+    const f = readForm($('#sheet'), x.type !== 'miss'); if (!f) return;
+    const op = { op: 'edit', id: x.id, date: f.date, note: f.note };
+    if (x.type !== 'miss') op.amount = f.amount;
+    queue(op);
+    const s = $('#sheet #stSel .on');
+    if (isAdmin() && s && s.dataset.s !== x.status) queue({ op: 'status', id: x.id, status: s.dataset.s, reason: x.reason });
+    closeSheet(); toast('Đã lưu');
+  },
+  delEntry: b => {
+    if (b.dataset.arm !== '1') { b.dataset.arm = '1'; b.textContent = 'Chạm lần nữa để xoá'; setTimeout(() => { if (b.isConnected) { b.dataset.arm = ''; b.textContent = 'Xoá'; } }, 3000); return; }
+    queue({ op: 'del', id: b.dataset.id }); closeSheet(); toast('Đã xoá');
+  },
+  syncNow: () => { SY.st = SY.st === 'locked' ? SY.st : 'idle'; syncNow(true); toast('Đang đồng bộ…', 1200); },
+  shareLink: async () => {
+    try {
+      const r = await api('GET', 'admin/key');
+      const url = apiBase() + '/tra-no.html#k=' + r.key;
+      const text = `Link ghi khoản trả hằng ngày (mở bằng Chrome, lưu lại để dùng): ${url}`;
+      if (navigator.share) { try { await navigator.share({ title: 'Trả dần mỗi ngày', text, url }); return; } catch (e) { if (e && e.name === 'AbortError') return; } }
+      showLink(url);
+    } catch (e) { toast(errText(e), 3500); }
+  },
+  newLink: async b => {
+    if (b.dataset.arm !== '1') { b.dataset.arm = '1'; b.textContent = 'Chạm lần nữa: link cũ sẽ ngừng hoạt động'; return; }
+    try { const r = await api('POST', 'admin/key'); showLink(apiBase() + '/tra-no.html#k=' + r.key, true); } catch (e) { toast(errText(e), 3500); }
+  },
+  saveSettings: () => {
+    const sh = $('#sheet'), err = sh.querySelector('#sErr');
+    const t = parseAmount(sh.querySelector('[name=sTarget]').value);
+    if (!t) { err.textContent = 'Mục tiêu chưa hợp lệ.'; return; }
+    const start = sh.querySelector('[name=sStart]').value;
+    if (start && !isDate(start)) { err.textContent = 'Ngày bắt đầu chưa hợp lệ.'; return; }
+    queue({ op: 'settings', data: { target: t, payer: sh.querySelector('[name=sPayer]').value.trim(), admin: sh.querySelector('[name=sAdmin]').value.trim(), start } });
+    closeSheet(); toast('Đã lưu thiết lập');
+  },
+  lite: b => { DEV.lite = !DEV.lite; saveDev(); document.body.classList.toggle('lite', DEV.lite); b.classList.toggle('on', DEV.lite); },
+  export: () => doExport(),
+  share: () => doShare(),
+  csv: () => doCsv(),
+  import: () => { if (navigator.onLine === false) return toast('Cần có mạng để nhập dữ liệu.'); importPick(); },
+  impDo: b => importDo(b.dataset.m),
+  copyText: () => { const t = $('#sheet textarea'); t.select(); try { navigator.clipboard.writeText(t.value).then(() => toast('Đã sao chép'), () => document.execCommand('copy')); } catch (e) { document.execCommand('copy'); toast('Đã sao chép'); } },
+  diag: () => {
+    const d = lsJSON(LS.diag, []);
+    const rep = [`Trả dần mỗi ngày v1 · ${new Date().toISOString()}`, `vai trò: ${AUTH ? AUTH.role : '-'} · đồng bộ: ${syncLine()} · chờ gửi: ${OUT.length}`, `số khoản: ${VIEW.entries.length} · ${navigator.userAgent}`, ...(Array.isArray(d) ? d : [])].join('\n');
+    openSheet(`<h3>Chẩn đoán</h3><pre class="diag">${esc(rep)}</pre><div class="btns"><button class="btn s" data-act="copyDiag">Sao chép báo cáo</button><button class="btn g s" data-act="clearDiag">Xoá nhật ký</button></div>`);
+  },
+  copyDiag: () => { const t = $('#sheet pre').textContent; try { navigator.clipboard.writeText(t).then(() => toast('Đã sao chép')); } catch (e) { toast('Không sao chép được'); } },
+  clearDiag: () => { lsDel(LS.diag); closeSheet(); toast('Đã xoá nhật ký'); },
+  logout: b => {
+    if (b.dataset.arm !== '1') { b.dataset.arm = '1'; b.textContent = OUT.length ? `Còn ${OUT.length} thay đổi chưa gửi! Chạm lần nữa` : 'Chạm lần nữa để đăng xuất'; return; }
+    AUTH = null; saveAuth(); CACHE = cleanCache({}); saveCache(); OUT = []; saveOut(); SY.st = 'idle';
+    closeSheet(); safeRender();
+  },
+  erase: async b => {
+    if (b.dataset.arm !== '1' || Date.now() - eraseArm > 5000) { b.dataset.arm = '1'; eraseArm = Date.now(); b.textContent = 'Chạm lần nữa: xoá trên MỌI máy'; return; }
+    try { const r = await api('POST', 'admin/erase'); OUT = []; saveOut(); takeSnap(r); closeSheet(); safeRender(); toast('Đã xoá toàn bộ'); } catch (e) { toast(errText(e), 3500); }
+  },
+  login: () => login(($('#wPin') || {}).value || '', (($('#wSrv') || {}).value || '').trim()),
+  relogin: () => pinSheet(),
+  reloginDo: () => login(($('#rPin') || {}).value || '', AUTH && AUTH.server || ''),
+  becomePayer: b => { AUTH = { role: 'payer', key: b.dataset.k, server: AUTH && AUTH.server || '' }; saveAuth(); CACHE = cleanCache({}); saveCache(); OUT = []; saveOut(); SY.st = 'idle'; closeSheet(); safeRender(); syncNow(true); },
+  dot: () => toast(syncLine(), 2600)
+};
+function showLink(url, isNew) {
+  openSheet(`<h3>${isNew ? 'Link mới' : 'Link cho người trả'}</h3><p class="sm">${isNew ? 'Link cũ đã ngừng hoạt động. ' : ''}Sao chép và gửi qua Zalo.</p>
+    <textarea class="in" style="min-height:80px;font:13px var(--mono);margin-top:10px" readonly>${esc(url)}</textarea>
+    <div class="btns"><button class="btn" data-act="copyText">Sao chép</button></div>`);
+}
+
+document.addEventListener('click', e => {
+  const b = e.target.closest('[data-act]');
+  if (!b || b.disabled) return;
+  const f = ACT[b.dataset.act]; if (!f) return;
+  e.preventDefault();
+  try { const r = f(b); if (r && r.catch) r.catch(err => logDiag('act ' + b.dataset.act + ': ' + (err && err.message))); }
+  catch (err) { logDiag('act ' + b.dataset.act + ': ' + (err && err.stack || err)); toast('Có lỗi xảy ra'); }
+});
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Enter' || !e.target.matches('input')) return;
+  if (e.target.id === 'wPin' || e.target.id === 'wSrv') ACT.login();
+  else if (e.target.id === 'rPin') ACT.reloginDo();
+});
+$('#scrim').addEventListener('click', () => closeSheet());
+
+/* ---------- lifecycle ---------- */
+function visMark(v) { lsSet(LS.vis, JSON.stringify({ vis: v, t: Date.now() })); }
+function startup() {
+  loadAll();
+  const vis = lsJSON(LS.vis, {});
+  if (vis && vis.vis === 1 && Date.now() - vis.t < 10 * 60e3 && !DEV.lite) {
+    DEV.lite = true; saveDev(); logDiag('lite mode turned on after an unexpected close');
+    setTimeout(() => toast('Đã bật chế độ nhẹ vì lần trước trang bị đóng đột ngột', 3500), 600);
+  }
+  document.body.classList.toggle('lite', DEV.lite);
+  pickTheme();
+  takeLinkKey();
+  setupBackGuard();
+  safeRender();
+  visMark(1);
+  if (AUTH) syncNow(true);
+  setInterval(() => {
+    if (document.hidden) return;
+    visMark(1);
+    syncNow();
+    const a = document.activeElement;
+    if (!(a && /INPUT|TEXTAREA|SELECT/.test(a.tagName))) requestRender(); else drawHeader();
+  }, 30000);
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) { visMark(0); flushOnHide(); }
+    else { visMark(1); UI.sceneKey === UI.theme + phaseOf(NOW().getHours()) || drawHeader(); syncNow(); }
+  });
+  window.addEventListener('pagehide', () => { visMark(0); flushOnHide(); });
+  window.addEventListener('hashchange', () => { if (/[#&]k=/.test(location.hash)) { takeLinkKey(); safeRender(); syncNow(true); } });
+  window.addEventListener('online', () => syncNow(true));
+  window.addEventListener('offline', () => setSync('offline'));
+  if ('serviceWorker' in navigator && /^https:$/.test(location.protocol)) navigator.serviceWorker.register('sw.js').catch(e => logDiag('sw: ' + e.message));
+}
+startup();
