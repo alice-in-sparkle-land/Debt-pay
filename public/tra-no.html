@@ -268,7 +268,7 @@ let AUTH = null;        // {role:'admin'|'payer', pin?, key?, server}
 let CACHE = { v: 0, settings: { ...DEF_SETTINGS }, entries: [] };
 let OUT = [];           // ops waiting to be sent
 let DEV = {};           // device-only: theme lock, lite, lastExport
-const UI = { range: 30, filter: 'all', cal: '', more: 30, pmore: 10, theme: 'forest', phase: 'day', sceneKey: '' };
+const UI = { range: 30, filter: 'all', cal: '', more: 30, pmore: 10, draft: null, theme: 'forest', phase: 'day', sceneKey: '' };
 
 function cleanEntry(x) {
   if (!x || typeof x !== 'object' || typeof x.id !== 'string' || !/^[A-Za-z0-9-]{4,40}$/.test(x.id)) return null;
@@ -561,10 +561,15 @@ function historyCard(admin) {
 
 function payerHome(s) {
   const st = VIEW.settings;
-  const btnTxt = s.todayPaid ? '+ Ghi thêm khoản đã chuyển' : `+ Đã chuyển ${money(st.target)} hôm nay`;
-  return bannerHtml() + streakCard(s, true) +
-    `<button class="btn" data-act="pay" style="margin-bottom:8px">${esc(btnTxt)}</button>` +
-    (s.todayPaid ? '' : `<div style="text-align:center;margin-bottom:12px"><button class="link" data-act="miss">Hôm nay chưa trả được</button></div>`) +
+  /* amount box right on the home screen; what he typed survives background refreshes */
+  const val = UI.draft != null ? UI.draft : s.todayPaid ? '' : String(st.target).replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+  const pay = `<div class="card" id="quick" data-cheer="1"><div class="msg" style="font-size:17px">Ghi lại số tiền trả hôm nay:</div>
+      ${amountField(0, '').replace('value=""', `value="${esc(val)}"`)}
+      <div class="err"></div>
+      <button class="btn" data-act="quickPay" style="margin-top:12px">Gửi cho ${esc(st.admin)} xác nhận</button>
+      <div class="hrow" style="justify-content:center;gap:22px;margin-top:6px;white-space:nowrap"><button class="link" data-act="payMore">Thêm ghi chú</button>
+      ${s.todayPaid ? '' : '<button class="link" data-act="miss" style="color:var(--mut)">Hôm nay chưa trả được</button>'}</div></div>`;
+  return bannerHtml() + streakCard(s, false) + pay + card(`<div class="lbl">Lịch trả</div>${calendarHtml(s)}`) +
     badgesCard(s) + owedCard(s) + chartCard(s) + historyCard(false);
 }
 function adminHome(s) {
@@ -591,6 +596,8 @@ function render() {
   if (!AUTH) { app.innerHTML = bannerHtml() + welcomeHtml(); return; }
   const s = stats();
   app.innerHTML = isAdmin() ? adminHome(s) : payerHome(s);
+  const q = $('#quick');
+  if (q) { bindAmount(q); const inp = q.querySelector('[name=amt]'); inp.addEventListener('input', () => { UI.draft = inp.value; }); q.querySelectorAll('[data-chip]').forEach(b => b.addEventListener('click', () => { UI.draft = inp.value; })); }
 }
 let renderFailed = false;
 function safeRender() {
@@ -681,14 +688,14 @@ function cheerText(total) {
   return 'Quá đỉnh! Cảm ơn anh nhiều 🎉';
 }
 const dayRepayTotal = (date, exclId) => VIEW.entries.filter(x => x.type === 'repay' && x.status !== 'rejected' && x.date === date && x.id !== exclId).reduce((a, x) => a + x.amount, 0);
-function amountField(val) {
-  return `<div class="fld"><label>Số tiền</label><input class="in amt" name="amt" inputmode="numeric" autocomplete="off" value="${val ? esc(String(val).replace(/\B(?=(\d{3})+(?!\d))/g, '.')) : ''}" placeholder="150.000">
-    <div class="sm" id="amtHint" style="margin-top:4px">&nbsp;</div><div class="celebrate hidden" id="cheer" style="margin-top:6px"></div>
+function amountField(val, label = 'Số tiền') {
+  return `<div class="fld">${label ? `<label>${label}</label>` : ''}<input class="in amt" name="amt" inputmode="numeric" autocomplete="off" value="${val ? esc(String(val).replace(/\B(?=(\d{3})+(?!\d))/g, '.')) : ''}" placeholder="150.000">
+    <div class="sm amtHint" style="margin-top:4px">&nbsp;</div><div class="celebrate cheer hidden" style="margin-top:6px"></div>
     <div class="chips">${CHIPS.map(c => `<button type="button" data-chip="${c}" class="${c === val ? 'on' : ''}">${short(c)}</button>`).join('')}</div></div>`;
 }
 function bindAmount(sh) {
   const inp = sh.querySelector('[name=amt]'); if (!inp) return;
-  const box = sh.querySelector('#cheer'), dateIn = sh.querySelector('[name=date]');
+  const box = sh.querySelector('.cheer'), dateIn = sh.querySelector('[name=date]');
   const upd = () => {
     const v = parseAmount(inp.value);
     let hint = inp.value ? (v ? '= ' + money(v) : 'Số tiền chưa hợp lệ') : ' ', msg = '';
@@ -697,7 +704,7 @@ function bindAmount(sh) {
       if (prev) hint += ' · cả ngày ' + money(prev + v);
       msg = cheerText(prev + v);
     }
-    sh.querySelector('#amtHint').textContent = hint;
+    sh.querySelector('.amtHint').textContent = hint;
     if (box) { box.textContent = msg; box.classList.toggle('hidden', !msg); }
     sh.querySelectorAll('[data-chip]').forEach(b => b.classList.toggle('on', +b.dataset.chip === v));
   };
@@ -719,10 +726,10 @@ function readForm(sh, needAmt) {
   return { date, amount, note: n ? n.value.trim().slice(0, 200) : '' };
 }
 
-function paySheet(date) {
+function paySheet(date, amount) {
   const st = VIEW.settings;
   openSheet(`<h3>Ghi khoản đã chuyển</h3><p class="sm">${esc(st.admin)} sẽ xác nhận khi nhận được tiền.</p>
-    ${amountField(st.target)}${dateField(date || todayKey(), 'Ngày chuyển')}${noteField('', 'VD: chuyển khoản MB')}
+    ${amountField(amount || st.target)}${dateField(date || todayKey(), 'Ngày chuyển')}${noteField('', 'VD: chuyển khoản MB')}
     <div class="err"></div><div class="btns"><button class="btn g" data-act="close">Huỷ</button><button class="btn" data-act="paySave">Gửi</button></div>`, sh => { if (!isAdmin()) sh.dataset.cheer = '1'; bindAmount(sh); });
 }
 function missSheet(date) {
@@ -1054,6 +1061,12 @@ function takeLinkKey() {
 }
 
 /* ---------- actions ---------- */
+function sendPay(amount, date, note) {
+  const total = dayRepayTotal(date) + amount;
+  UI.draft = null;
+  queue({ op: 'add', id: newId('p'), type: 'repay', amount, date, note });
+  toast(isAdmin() ? 'Đã lưu' : `Đã gửi ${money(amount)} · ${cheerText(total)}`, 3500);
+}
 let eraseArm = 0;
 const ACT = {
   close: () => closeSheet(),
@@ -1078,10 +1091,15 @@ const ACT = {
   rejectSave: b => { const n = $('#sheet [name=note]'); queue({ op: 'status', id: b.dataset.id, status: 'rejected', reason: n ? n.value.trim().slice(0, 200) : '' }); closeSheet(); toast('Đã từ chối'); },
   paySave: () => {
     const f = readForm($('#sheet'), true); if (!f) return;
-    const total = dayRepayTotal(f.date) + f.amount;
-    queue({ op: 'add', id: newId('p'), type: 'repay', amount: f.amount, date: f.date, note: f.note });
-    closeSheet(); toast(isAdmin() ? 'Đã lưu' : `Đã gửi ${money(f.amount)} · ${cheerText(total)}`, 3500);
+    closeSheet(); sendPay(f.amount, f.date, f.note);
   },
+  quickPay: () => {
+    const q = $('#quick'), err = q.querySelector('.err'), amount = parseAmount(q.querySelector('[name=amt]').value);
+    if (!amount) { err.textContent = 'Nhập số tiền (ít nhất 1.000đ).'; return; }
+    if (document.activeElement) document.activeElement.blur();
+    sendPay(amount, todayKey(), '');
+  },
+  payMore: () => { const q = $('#quick'); paySheet(todayKey(), q ? parseAmount(q.querySelector('[name=amt]').value) : 0); },
   missSave: () => {
     const f = readForm($('#sheet'), false); if (!f) return;
     queue({ op: 'add', id: newId('m'), type: 'miss', amount: 0, date: f.date, note: f.note });
@@ -1176,6 +1194,7 @@ document.addEventListener('keydown', e => {
   if (e.key !== 'Enter' || !e.target.matches('input')) return;
   if (e.target.id === 'wPin' || e.target.id === 'wSrv') ACT.login();
   else if (e.target.id === 'rPin') ACT.reloginDo();
+  else if (e.target.closest('#quick')) { e.preventDefault(); ACT.quickPay(); }
 });
 $('#scrim').addEventListener('click', () => closeSheet());
 
