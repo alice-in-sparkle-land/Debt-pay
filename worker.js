@@ -12,6 +12,12 @@
    POST /api/admin/key            -> {key}  new link, old one stops working (admin)
    POST /api/admin/import {mode:'merge'|'replace', entries:[...], settings?} (admin)
    POST /api/admin/erase          (admin)
+   GET  /api/push/key             -> {key}  public key for phone notifications
+   POST /api/push/sub {sub}       save this phone's notification address (for its role)
+   POST /api/push/unsub {endpoint}
+   POST /api/push/test            send a test notification to this phone
+   Cron 11:00 UTC (18:00 VN): payer gets a reminder, or a thank-you if he already paid today.
+   Admin phones get a notification whenever the payer adds a payment.
 */
 const HOME = '/tra-no.html';
 const MAX_BODY = 2e6;
@@ -31,7 +37,8 @@ async function setup(db) {
       date TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, by TEXT NOT NULL,
       reason TEXT NOT NULL DEFAULT '', created INTEGER NOT NULL, updated INTEGER NOT NULL)`),
     db.prepare('CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL)'),
-    db.prepare('CREATE TABLE IF NOT EXISTS guard (k TEXT PRIMARY KEY, fails INTEGER NOT NULL, since INTEGER NOT NULL, until INTEGER NOT NULL)')
+    db.prepare('CREATE TABLE IF NOT EXISTS guard (k TEXT PRIMARY KEY, fails INTEGER NOT NULL, since INTEGER NOT NULL, until INTEGER NOT NULL)'),
+    db.prepare('CREATE TABLE IF NOT EXISTS subs (endpoint TEXT PRIMARY KEY, role TEXT NOT NULL, p256dh TEXT NOT NULL, auth TEXT NOT NULL, created INTEGER NOT NULL, fails INTEGER NOT NULL DEFAULT 0)')
   ]);
   ready = true;
 }
@@ -183,7 +190,7 @@ function cleanImportRow(x) {
 }
 
 /* ---------- routing ---------- */
-async function api(request, env, path) {
+async function api(request, env, path, ctx) {
   if (!env.DB) return json({ error: 'setup', detail: 'Chưa liên kết cơ sở dữ liệu D1 (DB).' }, 500);
   if (!env.ADMIN_PIN || !/^\d{4,8}$/.test(String(env.ADMIN_PIN).trim())) return json({ error: 'setup', detail: 'Chưa đặt ADMIN_PIN (4–8 chữ số).' }, 500);
   await setup(env.DB);
@@ -213,8 +220,13 @@ async function api(request, env, path) {
     const results = [];
     for (const op of ops) results.push(await applyOp(db, role, op));
     if (results.some(r => r.ok && !r.dup)) await bump(db);
+    if (role === 'payer') {
+      const added = ops.filter((op, i) => results[i].ok && !results[i].dup && op.op === 'add' && op.type === 'repay');
+      if (added.length) { const job = notifyAdmins(env, added).catch(() => {}); if (ctx && ctx.waitUntil) ctx.waitUntil(job); else await job; }
+    }
     return json({ results, ...(await snapshot(db, role)) });
   }
+  if (path.startsWith('push/')) return pushApi(db, role, path.slice(5), m, body, env);
   if (path.startsWith('admin/')) {
     if (role !== 'admin') return json({ error: 'forbidden' }, 403);
     const what = path.slice(6);
@@ -250,25 +262,155 @@ async function api(request, env, path) {
   return json({ error: 'not found' }, 404);
 }
 
-async function safeApi(request, env, path) {
+async function safeApi(request, env, path, ctx) {
   const spare = request.method === 'POST' ? request.clone() : request;
   try {
-    return await api(request, env, path);
+    return await api(request, env, path, ctx);
   } catch (e) {
     const msg = String(e && e.message || e);
     if (/no such table/i.test(msg)) {           // database was emptied: recreate and try once more
       ready = false;
-      try { return await api(spare, env, path); } catch (e2) { return json({ error: 'server', detail: String(e2 && e2.message || e2).slice(0, 200) }, 500); }
+      try { return await api(spare, env, path, ctx); } catch (e2) { return json({ error: 'server', detail: String(e2 && e2.message || e2).slice(0, 200) }, 500); }
     }
     return json({ error: 'server', detail: msg.slice(0, 200) }, 500);
   }
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    if (url.pathname.startsWith('/api/')) return safeApi(request, env, url.pathname.slice(5).replace(/\/+$/, ''));
+    if (url.pathname.startsWith('/api/')) return safeApi(request, env, url.pathname.slice(5).replace(/\/+$/, ''), ctx);
     if (url.pathname === '/' || url.pathname === '/index.html') return Response.redirect(url.origin + HOME + url.search + url.hash, 302);
     return env.ASSETS.fetch(request);
+  },
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(dailyReminder(env).catch(e => console.log('reminder failed', e && e.message)));
   }
 };
+
+/* =====================================================================
+   Phone notifications (Web Push). No outside service or extra secret:
+   the signing key is created on first use and kept in the database.
+   ===================================================================== */
+const PUSH_FROM = 'mailto:tra-no@users.noreply.github.com';
+const b64u = buf => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+function unb64u(s) { s = String(s).replace(/-/g, '+').replace(/_/g, '/'); while (s.length % 4) s += '='; const b = atob(s); return Uint8Array.from(b, c => c.charCodeAt(0)); }
+const enc = new TextEncoder();
+const cat = (...a) => { const out = new Uint8Array(a.reduce((n, x) => n + x.length, 0)); let o = 0; for (const x of a) { out.set(x, o); o += x.length; } return out; };
+async function hmac(key, data) { const k = await crypto.subtle.importKey('raw', key, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']); return new Uint8Array(await crypto.subtle.sign('HMAC', k, data)); }
+async function hkdf(salt, ikm, info, len) { const prk = await hmac(salt, ikm); return (await hmac(prk, cat(info, new Uint8Array([1])))).slice(0, len); }
+
+let VAPID = null;
+async function vapid(db) {
+  if (VAPID) return VAPID;
+  let row = await kvGet(db, 'vapid');
+  if (!row) {
+    const kp = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
+    const jwk = await crypto.subtle.exportKey('jwk', kp.privateKey);
+    const pub = b64u(await crypto.subtle.exportKey('raw', kp.publicKey));
+    await db.prepare("INSERT INTO kv (k,v) VALUES ('vapid',?) ON CONFLICT(k) DO NOTHING").bind(JSON.stringify({ jwk, pub })).run();
+    row = await kvGet(db, 'vapid');
+  }
+  const { jwk, pub } = JSON.parse(row);
+  const key = await crypto.subtle.importKey('jwk', jwk, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']);
+  VAPID = { key, pub };
+  return VAPID;
+}
+async function vapidHeader(db, endpoint) {
+  const v = await vapid(db);
+  const head = b64u(enc.encode(JSON.stringify({ typ: 'JWT', alg: 'ES256' })));
+  const body = b64u(enc.encode(JSON.stringify({ aud: new URL(endpoint).origin, exp: Math.floor(Date.now() / 1000) + 12 * 3600, sub: PUSH_FROM })));
+  const sig = await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, v.key, enc.encode(head + '.' + body));
+  return `vapid t=${head}.${body}.${b64u(sig)}, k=${v.pub}`;
+}
+/* RFC 8291 message encryption (aes128gcm) */
+async function encryptPush(sub, text) {
+  const ua = unb64u(sub.p256dh), secret = unb64u(sub.auth);
+  const eph = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
+  const asPub = new Uint8Array(await crypto.subtle.exportKey('raw', eph.publicKey));
+  const uaKey = await crypto.subtle.importKey('raw', ua, { name: 'ECDH', namedCurve: 'P-256' }, false, []);
+  const shared = new Uint8Array(await crypto.subtle.deriveBits({ name: 'ECDH', public: uaKey }, eph.privateKey, 256));
+  const ikm = await hkdf(secret, shared, cat(enc.encode('WebPush: info\0'), ua, asPub), 32);
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const cek = await hkdf(salt, ikm, enc.encode('Content-Encoding: aes128gcm\0'), 16);
+  const nonce = await hkdf(salt, ikm, enc.encode('Content-Encoding: nonce\0'), 12);
+  const k = await crypto.subtle.importKey('raw', cek, 'AES-GCM', false, ['encrypt']);
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv: nonce }, k, cat(enc.encode(text), new Uint8Array([2]))));
+  const rs = new Uint8Array([0, 0, 16, 0]);
+  return cat(salt, rs, new Uint8Array([asPub.length]), asPub, ct);
+}
+async function sendPush(db, sub, msg, ttl) {
+  try {
+    const r = await fetch(sub.endpoint, {
+      method: 'POST',
+      headers: { 'Content-Encoding': 'aes128gcm', 'Content-Type': 'application/octet-stream', TTL: String(ttl || 14400), Urgency: 'high', Authorization: await vapidHeader(db, sub.endpoint) },
+      body: await encryptPush(sub, JSON.stringify(msg))
+    });
+    if (r.status === 404 || r.status === 410) { await db.prepare('DELETE FROM subs WHERE endpoint=?').bind(sub.endpoint).run(); return 'gone'; }
+    if (!r.ok) { await db.prepare('UPDATE subs SET fails=fails+1 WHERE endpoint=?').bind(sub.endpoint).run(); return 'http ' + r.status; }
+    if (sub.fails) await db.prepare('UPDATE subs SET fails=0 WHERE endpoint=?').bind(sub.endpoint).run();
+    return 'ok';
+  } catch (e) { return 'error ' + (e && e.message); }
+}
+async function pushTo(db, role, msg, ttl) {
+  const { results } = await db.prepare('SELECT * FROM subs WHERE role=? AND fails < 20').bind(role).all();
+  return Promise.all(results.map(s => sendPush(db, s, msg, ttl)));
+}
+async function getSettings(db) { try { return cleanSettings(JSON.parse(await kvGet(db, 'settings') || '{}')); } catch (e) { return DEF_SETTINGS; } }
+const vnd = n => String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, '.') + 'đ';
+const capFirst = s => s.charAt(0).toUpperCase() + s.slice(1);
+
+async function notifyAdmins(env, added) {
+  const db = env.DB, st = await getSettings(db);
+  const total = added.reduce((n, op) => n + (cleanAmount(op.amount) || 0), 0);
+  const body = added.length === 1 ? `${capFirst(st.payer)} vừa gửi ${vnd(total)} · chờ ${st.admin} xác nhận` : `${capFirst(st.payer)} vừa gửi ${added.length} khoản · ${vnd(total)} · chờ ${st.admin} xác nhận`;
+  return pushTo(db, 'admin', { title: '💰 Có khoản trả mới', body, tag: 'pending' }, 86400);
+}
+async function dailyReminder(env, today) {
+  const db = env.DB;
+  await setup(db);
+  const st = await getSettings(db);
+  today = today || vnToday();
+  const { results } = await db.prepare("SELECT date, type, SUM(amount) AS amt FROM entries WHERE status != 'rejected' AND date >= ? GROUP BY date, type").bind(addDays(today, -400)).all();
+  const paid = {}, missed = {};
+  for (const r of results) { if (r.type === 'repay') paid[r.date] = r.amt; if (r.type === 'miss') missed[r.date] = 1; }
+  let msg;
+  if (paid[today]) {
+    let streak = 0; for (let d = today; paid[d]; d = addDays(d, -1)) streak++;
+    msg = { title: 'Hôm nay xong rồi 🎉', body: `Cảm ơn anh! Hôm nay đã gửi ${vnd(paid[today])}` + (streak > 1 ? ` · chuỗi ${streak} ngày 🔥` : ''), tag: 'daily' };
+  } else if (missed[today]) {
+    return { skipped: 'miss note today' };
+  } else {
+    msg = { title: 'Trả dần mỗi ngày', body: `Một ngày nỗ lực tuyệt vời, đừng quên ck cho ${st.admin} nha 💪`, tag: 'daily' };
+  }
+  return { msg, sent: await pushTo(db, 'payer', msg, 4 * 3600) };
+}
+async function pushApi(db, role, what, m, body, env) {
+  const EP = env && env.PUSH_DEV === '1' ? /^https?:\/\/[^\s]{10,900}$/ : /^https:\/\/[^\s]{10,900}$/;   // PUSH_DEV only for local tests
+  if (what === 'key' && m === 'GET') return json({ key: (await vapid(db)).pub });
+  if (what === 'sub' && m === 'POST') {
+    const s = body && body.sub, k = s && s.keys;
+    if (!s || typeof s.endpoint !== 'string' || !EP.test(s.endpoint) || !k || !/^[A-Za-z0-9_-]{80,100}$/.test(k.p256dh || '') || !/^[A-Za-z0-9_-]{16,30}$/.test(k.auth || ''))
+      return json({ error: 'sub' }, 400);
+    const n = await db.prepare('SELECT COUNT(*) AS n FROM subs').first();
+    if (n && n.n >= 30) await db.prepare('DELETE FROM subs WHERE endpoint IN (SELECT endpoint FROM subs ORDER BY created LIMIT 1)').run();
+    await db.prepare('INSERT INTO subs (endpoint, role, p256dh, auth, created) VALUES (?,?,?,?,?) ON CONFLICT(endpoint) DO UPDATE SET role=excluded.role, p256dh=excluded.p256dh, auth=excluded.auth, fails=0')
+      .bind(s.endpoint, role, k.p256dh, k.auth, Date.now()).run();
+    return json({ ok: true });
+  }
+  if (what === 'unsub' && m === 'POST') {
+    if (body && typeof body.endpoint === 'string') await db.prepare('DELETE FROM subs WHERE endpoint=?').bind(body.endpoint).run();
+    return json({ ok: true });
+  }
+  if (what === 'test' && m === 'POST') {
+    const ep = body && body.endpoint;
+    const s = typeof ep === 'string' && await db.prepare('SELECT * FROM subs WHERE endpoint=?').bind(ep).first();
+    if (!s) return json({ error: 'nosub' }, 404);
+    const msg = role === 'payer'
+      ? { title: 'Trả dần mỗi ngày', body: 'Đã bật nhắc nhở ✓ Mỗi ngày lúc 18:00 sẽ có lời nhắc ở đây.', tag: 'test' }
+      : { title: 'Trả dần mỗi ngày', body: 'Đã bật thông báo ✓ Sẽ báo ngay khi có khoản trả mới.', tag: 'test' };
+    return json({ result: await sendPush(db, s, msg, 600) });
+  }
+  if (what === 'remind' && m === 'POST' && role === 'admin') return json(await dailyReminder({ DB: db }, body && body.today));
+  return json({ error: 'not found' }, 404);
+}

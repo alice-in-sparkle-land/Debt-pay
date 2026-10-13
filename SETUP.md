@@ -56,3 +56,14 @@ Go to ⚙ **Cài đặt → Gửi link** and send it through Zalo. He opens it o
 - The dot next to ⚙ shows sync status: green = synced, orange = syncing, grey = offline, red = a problem (tap it to see what).
 - After 6 wrong PINs from one place, the site pauses for 15 minutes.
 - Back up from time to time: ⚙ → **Xuất file**. Settings shows how many changes were made since your last backup.
+
+## Phone notifications (added 13/10)
+- **Anh Trường**: the home screen shows a card, **🔔 Nhắc nhở lúc 18:00 → Bật nhắc nhở**. He taps it once and allows notifications. Every day at 18:00 he gets:
+  - *"Một ngày nỗ lực tuyệt vời, đừng quên ck cho Mẫn nha 💪"* if he hasn't logged a payment yet today,
+  - *"Cảm ơn anh! Hôm nay đã gửi …"* (with his streak) if he has,
+  - nothing if he already tapped "Hôm nay chưa trả được".
+- **Mẫn**: tap **Bật thông báo** (home card or ⚙ Cài đặt → Thông báo). You get a notification whenever he logs a payment.
+- ⚙ → Thông báo → **Gửi lời nhắc hôm nay ngay** sends the 18:00 message right away (good for checking it works).
+- No extra setup: the schedule is in `wrangler.jsonc` (`"0 11 * * *"` = 18:00 Vietnam), and the signing key is created automatically.
+- If a phone's notifications stop: on some Android brands (Xiaomi, Oppo, Vivo), allow Chrome to run in the background (Settings → Apps → Chrome → Battery → No restrictions).
+

@@ -100,7 +100,7 @@ function loadAll() {
     AUTH = { role: a.role, pin: a.pin, key: a.key, server: /^https?:\/\/[^\s"'<>]+$/.test(a.server || '') ? a.server : '' };
   CACHE = cleanCache(lsJSON(LS.cache, {}));
   const o = lsJSON(LS.out, []); OUT = Array.isArray(o) ? o.filter(x => x && typeof x.op === 'string').slice(0, 500) : [];
-  const d = lsJSON(LS.dev, {}); DEV = { theme: Object.keys(THEMES).includes(d.theme) ? d.theme : '', lite: !!d.lite, lastExport: Number(d.lastExport) || 0 };
+  const d = lsJSON(LS.dev, {}); DEV = { theme: Object.keys(THEMES).includes(d.theme) ? d.theme : '', lite: !!d.lite, lastExport: Number(d.lastExport) || 0, pushHide: !!d.pushHide };
 }
 const saveAuth = () => AUTH ? lsSet(LS.auth, JSON.stringify(AUTH)) : lsDel(LS.auth);
 const saveCache = () => lsSet(LS.cache, JSON.stringify(CACHE));
@@ -367,11 +367,11 @@ function payerHome(s) {
       <button class="btn" data-act="quickPay" style="margin-top:12px">Gửi cho ${esc(st.admin)} xác nhận</button>
       <div class="hrow" style="justify-content:center;gap:22px;margin-top:6px;white-space:nowrap"><button class="link" data-act="payMore">Thêm ghi chú</button>
       ${s.todayPaid ? '' : '<button class="link" data-act="miss" style="color:var(--mut)">Hôm nay chưa trả được</button>'}</div></div>`;
-  return bannerHtml() + streakCard(s, false) + pay + card(`<div class="lbl">Lịch trả</div>${calendarHtml(s)}`) +
+  return bannerHtml() + streakCard(s, false) + pay + pushCard() + card(`<div class="lbl">Lịch trả</div>${calendarHtml(s)}`) +
     badgesCard(s) + owedCard(s) + chartCard(s) + historyCard(false);
 }
 function adminHome(s) {
-  return bannerHtml() + owedCard(s) + pendingCard() + streakCard(s, false) + chartCard(s) +
+  return bannerHtml() + owedCard(s) + pendingCard() + pushCard() + streakCard(s, false) + chartCard(s) +
     card(`<div class="lbl">Lịch trả</div>${calendarHtml(s)}`) + badgesCard(s) + historyCard(true);
 }
 function welcomeHtml() {
@@ -594,6 +594,7 @@ function settingsSheet() {
   openSheet(`<h3>Cài đặt</h3>
     <div class="sec"><div class="lbl">Đồng bộ</div><div class="row" style="margin-top:6px"><span>${esc(syncLine())}</span><button class="link" data-act="syncNow">Đồng bộ ngay</button></div>
       <p class="sm">Máy này: ${admin ? esc(st.admin) + ' (quản lý)' : esc(cap(st.payer))}${AUTH && AUTH.server ? ' · ' + esc(AUTH.server.replace(/^https?:\/\//, '')) : ''}</p></div>
+    ${pushSettingsHtml()}
     ${admin ? `<div class="sec"><div class="lbl">Link cho ${esc(st.payer)}</div>
       <p class="sm" style="margin-top:6px">Gửi link này qua Zalo. ${esc(cap(st.payer))} mở một lần là dùng được, không cần PIN, và chỉ ghi được khoản "chờ xác nhận".</p>
       <div class="btns"><button class="btn s" data-act="shareLink">Gửi link</button><button class="btn g s" data-act="newLink">Đổi link</button></div></div>
@@ -858,6 +859,99 @@ function takeLinkKey() {
   AUTH = { role: 'payer', key, server }; saveAuth(); SY.st = 'idle'; SY.msg = '';
 }
 
+/* ---------- phone notifications ---------- */
+const PUSH = { ok: false, on: false, busy: false, perm: 'default' };
+function pushSupported() {
+  try { return 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window && window.isSecureContext && /^https?:$/.test(location.protocol); } catch (e) { return false; }
+}
+function pushQuick() { PUSH.ok = pushSupported(); try { PUSH.perm = PUSH.ok ? Notification.permission : 'default'; } catch (e) { PUSH.perm = 'default'; } }
+function withTimeout(p, ms) { return Promise.race([p, new Promise((_, no) => setTimeout(() => no(new Error('timeout')), ms))]); }
+async function pushReg() { await navigator.serviceWorker.register('sw.js'); return withTimeout(navigator.serviceWorker.ready, 15000); }
+async function pushSub() { if (!pushSupported()) return null; const reg = await navigator.serviceWorker.getRegistration(); return reg ? reg.pushManager.getSubscription() : null; }
+function unb64u(s) { s = String(s).replace(/-/g, '+').replace(/_/g, '/'); while (s.length % 4) s += '='; const b = atob(s); return Uint8Array.from(b, c => c.charCodeAt(0)); }
+/* On start: learn the state, and quietly re-send this phone's address so the server list stays right. */
+async function pushRefresh(resend) {
+  const was = PUSH.ok + PUSH.perm + PUSH.on;
+  pushQuick();
+  if (!PUSH.ok) { if (was !== PUSH.ok + PUSH.perm + PUSH.on) requestRender(); return; }
+  try {
+    const sub = await pushSub();
+    PUSH.on = !!sub && PUSH.perm === 'granted';
+    if (PUSH.on && resend && AUTH) api('POST', 'push/sub', { sub: sub.toJSON() }).catch(() => {});
+    if (was !== PUSH.ok + PUSH.perm + PUSH.on) requestRender();
+  } catch (e) { logDiag('push state: ' + e.message); }
+}
+async function pushEnable(btn) {
+  if (PUSH.busy) return;
+  if (!pushSupported()) return toast('Trình duyệt này không hỗ trợ thông báo. Hãy mở bằng Chrome.', 3500);
+  if (navigator.onLine === false) return toast('Cần có mạng để bật thông báo.');
+  PUSH.busy = true; if (btn) { btn.disabled = true; btn.textContent = 'Đang bật…'; }
+  try {
+    const perm = await Notification.requestPermission();
+    PUSH.perm = perm;
+    if (perm !== 'granted') { toast(perm === 'denied' ? 'Thông báo đang bị chặn. Xem hướng dẫn trong ⚙ Cài đặt.' : 'Chưa bật. Chạm lại và chọn “Cho phép”.', 4000); return; }
+    const reg = await pushReg();
+    const { key } = await api('GET', 'push/key');
+    const want = unb64u(key);
+    let sub = await reg.pushManager.getSubscription();
+    if (sub) {                                   // made with another server key: start fresh
+      const have = sub.options && sub.options.applicationServerKey ? new Uint8Array(sub.options.applicationServerKey) : null;
+      if (have && (have.length !== want.length || have.some((v, i) => v !== want[i]))) { await sub.unsubscribe(); sub = null; }
+    }
+    if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: want });
+    await api('POST', 'push/sub', { sub: sub.toJSON() });
+    PUSH.on = true; DEV.pushHide = false; saveDev();
+    api('POST', 'push/test', { endpoint: sub.endpoint }).catch(() => {});
+    toast(isAdmin() ? 'Đã bật thông báo ✓' : 'Đã bật nhắc nhở lúc 18:00 ✓', 3000);
+  } catch (e) {
+    logDiag('push enable: ' + (e && (e.kind || e.message)));
+    toast(e && e.kind ? errText(e) : 'Không bật được thông báo (' + ((e && e.message) || 'lỗi') + ').', 4000);
+  } finally {
+    PUSH.busy = false; safeRender();
+    if (SHEET && $('#sheet [data-act=pushOn],#sheet [data-act=pushOff]')) settingsSheet();
+  }
+}
+async function pushDisable() {
+  try {
+    const sub = await pushSub();
+    if (sub) { await api('POST', 'push/unsub', { endpoint: sub.endpoint }).catch(() => {}); await sub.unsubscribe(); }
+  } catch (e) { logDiag('push off: ' + e.message); }
+  PUSH.on = false; safeRender(); if (SHEET) settingsSheet();
+  toast('Đã tắt thông báo trên máy này');
+}
+/* before this phone changes role or signs out: stop notifications meant for the old role */
+function pushForget() {
+  if (!PUSH.on) return;
+  const a = AUTH;
+  pushSub().then(sub => { if (!sub) return; return api('POST', 'push/unsub', { endpoint: sub.endpoint }, a).catch(() => {}).then(() => sub.unsubscribe()); }).catch(() => {});
+  PUSH.on = false;
+}
+function pushText() {
+  return isAdmin()
+    ? { t: '🔔 Bật thông báo', d: `Điện thoại sẽ báo ngay khi ${VIEW.settings.payer} gửi khoản mới.`, b: 'Bật thông báo' }
+    : { t: '🔔 Nhắc nhở lúc 18:00', d: 'Mỗi tối điện thoại sẽ nhắc anh chuyển tiền, hoặc cảm ơn nếu hôm nay anh đã gửi.', b: 'Bật nhắc nhở' };
+}
+function pushCard() {
+  if (!AUTH || !PUSH.ok || PUSH.on || DEV.pushHide || PUSH.perm === 'denied') return '';
+  const x = pushText();
+  return card(`<div class="msg">${x.t}</div><p class="sm" style="margin-top:4px">${esc(x.d)}</p>
+    <div class="btns"><button class="btn g s" data-act="pushLater">Để sau</button><button class="btn s" data-act="pushOn">${x.b}</button></div>`);
+}
+function pushSettingsHtml() {
+  if (!AUTH) return '';
+  const x = pushText(), admin = isAdmin();
+  let body;
+  if (!pushSupported()) body = '<p class="sm" style="margin-top:6px">Trình duyệt này không hỗ trợ thông báo. Hãy mở trang bằng Chrome.</p>';
+  else if (PUSH.perm === 'denied') body = `<p class="sm" style="margin-top:6px">Thông báo đang bị chặn cho trang này. Mở Chrome → chạm biểu tượng bên trái địa chỉ trang → <b>Quyền</b> → <b>Thông báo</b> → <b>Cho phép</b>, rồi quay lại đây.</p>
+      <div class="btns"><button class="btn g s" data-act="pushOn">Thử lại</button></div>`;
+  else body = `<div class="toggle"><span>${PUSH.on ? (admin ? 'Đang bật: báo khi có khoản mới' : 'Đang bật: nhắc lúc 18:00 mỗi ngày') : esc(x.d)}</span>
+      <button class="sw ${PUSH.on ? 'on' : ''}" data-act="${PUSH.on ? 'pushOff' : 'pushOn'}" aria-label="${x.b}"></button></div>
+      ${PUSH.on ? '<div class="btns"><button class="btn g s" data-act="pushTest">Gửi thử</button></div>' : ''}`;
+  return `<div class="sec"><div class="lbl">Thông báo</div>${body}
+    ${admin ? `<p class="sm" style="margin-top:10px">Lời nhắc 18:00 gửi tới điện thoại của ${esc(VIEW.settings.payer)}: “Một ngày nỗ lực tuyệt vời, đừng quên ck cho ${esc(VIEW.settings.admin)} nha 💪”, hoặc lời cảm ơn nếu hôm nay đã gửi.</p>
+      <div class="btns"><button class="btn g s" data-act="pushRemind">Gửi lời nhắc hôm nay ngay</button></div>` : ''}</div>`;
+}
+
 /* ---------- actions ---------- */
 function sendPay(amount, date, note) {
   const total = dayRepayTotal(date) + amount;
@@ -961,6 +1055,7 @@ const ACT = {
   clearDiag: () => { lsDel(LS.diag); closeSheet(); toast('Đã xoá nhật ký'); },
   logout: b => {
     if (b.dataset.arm !== '1') { b.dataset.arm = '1'; b.textContent = OUT.length ? `Còn ${OUT.length} thay đổi chưa gửi! Chạm lần nữa` : 'Chạm lần nữa để đăng xuất'; return; }
+    pushForget();
     AUTH = null; saveAuth(); CACHE = cleanCache({}); saveCache(); OUT = []; saveOut(); SY.st = 'idle';
     closeSheet(); safeRender();
   },
@@ -971,8 +1066,22 @@ const ACT = {
   login: () => login(($('#wPin') || {}).value || '', (($('#wSrv') || {}).value || '').trim()),
   relogin: () => pinSheet(),
   reloginDo: () => login(($('#rPin') || {}).value || '', AUTH && AUTH.server || ''),
-  becomePayer: b => { AUTH = { role: 'payer', key: b.dataset.k, server: AUTH && AUTH.server || '' }; saveAuth(); CACHE = cleanCache({}); saveCache(); OUT = []; saveOut(); SY.st = 'idle'; closeSheet(); safeRender(); syncNow(true); },
-  dot: () => toast(syncLine(), 2600)
+  becomePayer: b => { pushForget(); AUTH = { role: 'payer', key: b.dataset.k, server: AUTH && AUTH.server || '' }; saveAuth(); CACHE = cleanCache({}); saveCache(); OUT = []; saveOut(); SY.st = 'idle'; closeSheet(); safeRender(); syncNow(true); },
+  dot: () => toast(syncLine(), 2600),
+  pushOn: b => pushEnable(b),
+  pushOff: () => pushDisable(),
+  pushLater: () => { DEV.pushHide = true; saveDev(); safeRender(); toast('Có thể bật sau trong ⚙ Cài đặt'); },
+  pushTest: async () => {
+    try { const s = await pushSub(); if (!s) return toast('Máy này chưa bật thông báo'); const r = await api('POST', 'push/test', { endpoint: s.endpoint }); toast(r.result === 'ok' ? 'Đã gửi thử, kiểm tra thanh thông báo' : 'Gửi thử lỗi: ' + r.result, 3500); }
+    catch (e) { toast(errText(e), 3500); }
+  },
+  pushRemind: async () => {
+    try {
+      const r = await api('POST', 'push/remind', {});
+      const n = r.sent ? r.sent.filter(x => x === 'ok').length : 0;
+      toast(r.skipped ? 'Hôm nay anh ấy đã ghi lý do chưa trả được, không nhắc.' : n ? `Đã gửi tới ${n} máy: “${r.msg.body}”` : `${cap(VIEW.settings.payer)} chưa bật nhắc nhở trên điện thoại.`, 4000);
+    } catch (e) { toast(errText(e), 3500); }
+  }
 };
 function showLink(url, isNew) {
   openSheet(`<h3>${isNew ? 'Link mới' : 'Link cho người trả'}</h3><p class="sm">${isNew ? 'Link cũ đã ngừng hoạt động. ' : ''}Sao chép và gửi qua Zalo.</p>
@@ -1008,6 +1117,7 @@ function startup() {
   document.body.classList.toggle('lite', DEV.lite);
   pickTheme();
   takeLinkKey();
+  pushQuick();
   setupBackGuard();
   safeRender();
   visMark(1);
@@ -1021,12 +1131,13 @@ function startup() {
   }, 30000);
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) { visMark(0); flushOnHide(); }
-    else { visMark(1); UI.sceneKey === UI.theme + phaseOf(NOW().getHours()) || drawHeader(); syncNow(); }
+    else { visMark(1); UI.sceneKey === UI.theme + phaseOf(NOW().getHours()) || drawHeader(); syncNow(); pushRefresh(false); }
   });
   window.addEventListener('pagehide', () => { visMark(0); flushOnHide(); });
   window.addEventListener('hashchange', () => { if (/[#&]k=/.test(location.hash)) { takeLinkKey(); safeRender(); syncNow(true); } });
   window.addEventListener('online', () => syncNow(true));
   window.addEventListener('offline', () => setSync('offline'));
-  if ('serviceWorker' in navigator && /^https:$/.test(location.protocol)) navigator.serviceWorker.register('sw.js').catch(e => logDiag('sw: ' + e.message));
+  if ('serviceWorker' in navigator && window.isSecureContext && /^https?:$/.test(location.protocol)) navigator.serviceWorker.register('sw.js').catch(e => logDiag('sw: ' + e.message));
+  pushRefresh(true);
 }
 startup();
